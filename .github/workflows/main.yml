@@ -1,5 +1,5 @@
 
-name: Telegram Bot
+name: Telegram Gift Bot
 
 on:
   workflow_dispatch:
@@ -7,21 +7,20 @@ on:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
+      - name: Get code
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Install Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install requirements
+      - name: Install packages
         run: pip install -r requirements.txt
 
-      - name: Run Bot
+      - name: Start bot
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: python bot.py
+        run: python -u bot.py
