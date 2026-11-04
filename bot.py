@@ -317,6 +317,12 @@ class BuyGift(StatesGroup):
     waiting_recipient = State()
     confirming = State()
 
+# ⚠️ State های ادمین
+class AdminStates(StatesGroup):
+    waiting_user_id = State()
+    waiting_amount = State()
+
+
 def main_menu_keyboard():
     kb = ReplyKeyboardBuilder()
     kb.button(text=BTN_INVITE)
@@ -364,6 +370,15 @@ def channels_keyboard():
     kb.adjust(1)
     return kb.as_markup()
 
+def admin_panel_keyboard():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="➕ افزایش موجودی", callback_data="admin_add")
+    kb.button(text="➖ کاهش موجودی", callback_data="admin_sub")
+    kb.button(text="📊 آمار ربات", callback_data="admin_stats")
+    kb.button(text="🔙 بستن پنل", callback_data="main_menu")
+    kb.adjust(1)
+    return kb.as_markup()
+
 async def check_membership(bot: Bot, user_id: int) -> list[str]:
     missing = []
     for ch in CHANNELS:
@@ -398,77 +413,140 @@ async def process_referral(bot: Bot, user_id: int):
 router = Router()
 
 # ============================================================
-# ⚡ دستور جادویی ادمین: "آیدی مقدار"
-# مثال: 8935601841 20
+# ۱) ادمین: هندلرهای اصلی (بالاترین اولویت)
 # ============================================================
-@router.message(F.from_user.id == ADMIN_ID, F.text.regexp(r"^\s*-?\d+\s+-?\d+\s*$"))
-async def admin_balance_command(message: Message, bot: Bot):
-    """دستور متنی ساده برای تغییر موجودی. فقط ادمین."""
-    text = message.text.strip()
-    parts = text.split()
-    if len(parts) != 2:
+
+@router.message(Command("admin"))
+async def cmd_admin(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ دسترسی ندارید")
         return
+    await state.clear()
+    await message.answer(
+        "👨‍💻 **پنل مدیریت**\n\nیک گزینه را انتخاب کنید:",
+        reply_markup=admin_panel_keyboard(),
+        parse_mode="Markdown",
+    )
+
+@router.callback_query(F.data.in_({"admin_add", "admin_sub"}))
+async def cb_admin_change_balance(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("⛔ دسترسی ندارید", show_alert=True)
+        return
+    op = call.data
+    await state.update_data(admin_op=op)
+    await state.set_state(AdminStates.waiting_user_id)
+    action = "افزایش" if op == "admin_add" else "کاهش"
     try:
-        target_id = int(parts[0])
-        amount = int(parts[1])
-    except ValueError:
+        await call.message.edit_text(
+            f"✍️ **{action} موجودی**\n\nآیدی عددی کاربر مورد نظر را ارسال کنید:",
+            parse_mode="Markdown",
+        )
+    except Exception:
+        await call.message.answer(
+            f"✍️ **{action} موجودی**\n\nآیدی عددی کاربر مورد نظر را ارسال کنید:",
+            parse_mode="Markdown",
+        )
+    await call.answer()
+
+@router.callback_query(F.data == "admin_stats")
+async def cb_admin_stats(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("⛔ دسترسی ندارید", show_alert=True)
         return
+    async with db.pool.acquire() as conn:
+        users_count = await conn.fetchval("SELECT COUNT(*) FROM users")
+        orders_pending = await conn.fetchval("SELECT COUNT(*) FROM orders WHERE status='pending'")
+        orders_completed = await conn.fetchval("SELECT COUNT(*) FROM orders WHERE status='completed'")
+    text = (
+        f"📊 **آمار ربات**\n\n"
+        f"👥 تعداد کاربران: {users_count or 0}\n"
+        f"⏳ سفارش‌های در انتظار: {orders_pending or 0}\n"
+        f"✅ سفارش‌های تکمیل شده: {orders_completed or 0}\n"
+    )
+    try:
+        await call.message.edit_text(text, parse_mode="Markdown", reply_markup=admin_panel_keyboard())
+    except Exception:
+        await call.message.answer(text, parse_mode="Markdown", reply_markup=admin_panel_keyboard())
+    await call.answer()
 
-    logger.info(f"⚡ دستور ادمین: کاربر {target_id}، مقدار {amount}")
-
+@router.message(AdminStates.waiting_user_id)
+async def admin_get_user_id(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    text = (message.text or "").strip()
+    logger.info(f"📝 آیدی خام: {repr(text)}")
+    try:
+        target_id = int(text)
+    except (ValueError, TypeError):
+        await message.answer("❌ آیدی نامعتبر است. فقط عدد بفرستید.")
+        return
     target = await db.get_user(target_id)
     if not target:
-        await message.answer(f"❌ کاربر با آیدی `{target_id}` پیدا نشد.", parse_mode="Markdown")
+        await message.answer(f"❌ کاربری با آیدی {target_id} یافت نشد.")
+        return
+    await state.update_data(target_id=target_id)
+    await state.set_state(AdminStates.waiting_amount)
+    await message.answer(
+        f"👤 کاربر: {target['full_name'] or '-'}\n"
+        f"💰 موجودی فعلی: {target['balance']} استارز\n\n"
+        f"مقدار را وارد کنید (فقط عدد):",
+    )
+
+@router.message(AdminStates.waiting_amount)
+async def admin_get_amount(message: Message, state: FSMContext, bot: Bot):
+    if message.from_user.id != ADMIN_ID:
+        return
+    text = (message.text or "").strip()
+    logger.info(f"💵 مقدار خام: {repr(text)}")
+    try:
+        amount = int(text)
+        if amount <= 0:
+            raise ValueError
+    except (ValueError, TypeError):
+        await message.answer("❌ مقدار باید یه عدد مثبت باشه.")
+        return
+    data = await state.get_data()
+    op = data.get("admin_op")
+    target_id = data.get("target_id")
+    if not target_id:
+        await state.clear()
+        await message.answer("خطا: آیدی گم شد. دوباره /admin بزنید.")
         return
 
-    ok = await db.add_balance(target_id, amount)
+    signed = amount if op == "admin_add" else -amount
+    ok = await db.add_balance(target_id, signed)
     if not ok:
-        await message.answer("❌ خطا در تغییر موجودی.")
+        await message.answer("❌ کاربر پیدا نشد یا خطا رخ داد.")
+        await state.clear()
         return
 
     new_balance = await db.get_balance(target_id)
-    action = "افزایش" if amount > 0 else "کاهش"
-
+    action = "افزایش" if signed > 0 else "کاهش"
     await message.answer(
         f"✅ **{action} انجام شد**\n\n"
-        f"👤 کاربر: `{target_id}`\n"
-        f"💰 مقدار: {amount:+d} استارز\n"
-        f"📊 موجودی جدید: {new_balance} استارز",
+        f"کاربر: `{target_id}`\n"
+        f"مقدار: {signed:+d} استارز\n"
+        f"موجودی جدید: {new_balance} استارز",
         parse_mode="Markdown",
+        reply_markup=admin_panel_keyboard(),
     )
 
     try:
         await bot.send_message(
             target_id,
             f"🎁 موجودی شما تغییر کرد!\n"
-            f"مقدار: {amount:+d} استارز\n"
+            f"مقدار: {signed:+d} استارز\n"
             f"موجودی جدید شما: {new_balance} استارز"
         )
     except Exception:
         pass
 
-
-# ============================================================
-# /admin - راهنمای ساده
-# ============================================================
-@router.message(Command("admin"))
-async def cmd_admin(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    await message.answer(
-        "👨‍💻 **دستور ادمین**\n\n"
-        "برای تغییر موجودی کاربر، این الگو رو بفرست:\n\n"
-        "`آیدی عددی مقدار`\n\n"
-        "**مثال افزایش ۲۰ استارز:**\n"
-        "`8935601841 20`\n\n"
-        "**مثال کاهش ۲۰ استارز:**\n"
-        "`8935601841 -20`",
-        parse_mode="Markdown",
-    )
+    await state.clear()
 
 
 # ============================================================
-# استارت
+# ۲) استارت
 # ============================================================
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext, bot: Bot):
@@ -513,7 +591,7 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot):
 
 
 # ============================================================
-# دریافت شماره
+# ۳) دریافت شماره
 # ============================================================
 @router.message(F.contact)
 async def handle_contact(message: Message, state: FSMContext, bot: Bot):
@@ -568,7 +646,7 @@ async def handle_contact(message: Message, state: FSMContext, bot: Bot):
 
 
 # ============================================================
-# بررسی عضویت
+# ۴) بررسی عضویت
 # ============================================================
 @router.callback_query(F.data == "check_membership")
 async def cb_check_membership(call: CallbackQuery, bot: Bot):
@@ -603,10 +681,16 @@ async def cb_main_menu(call: CallbackQuery, state: FSMContext):
 
 
 # ============================================================
-# منوهای کاربر
+# ۵) منوهای کاربر (با چک state ادمین)
 # ============================================================
+async def _is_admin_busy(state: FSMContext) -> bool:
+    cur = await state.get_state()
+    return cur is not None and cur.startswith("AdminStates")
+
 @router.message(F.text == BTN_INVITE)
 async def show_invite_link(message: Message, bot: Bot, state: FSMContext):
+    if await _is_admin_busy(state):
+        return
     await state.clear()
     user_id = message.from_user.id
     user = await db.get_user(user_id)
@@ -624,11 +708,15 @@ async def show_invite_link(message: Message, bot: Bot, state: FSMContext):
 
 @router.message(F.text == BTN_BUY)
 async def show_gifts(message: Message, state: FSMContext):
+    if await _is_admin_busy(state):
+        return
     await state.clear()
     await message.answer("یک گیفت انتخاب کنید:", reply_markup=gift_keyboard())
 
 @router.message(F.text == BTN_BALANCE)
 async def show_balance(message: Message, state: FSMContext):
+    if await _is_admin_busy(state):
+        return
     await state.clear()
     try:
         user_id = message.from_user.id
@@ -652,7 +740,7 @@ async def show_balance(message: Message, state: FSMContext):
 
 
 # ============================================================
-# گیفت‌ها
+# ۶) گیفت‌ها
 # ============================================================
 @router.callback_query(F.data.startswith("gift:"))
 async def cb_select_gift(call: CallbackQuery, state: FSMContext, bot: Bot):
@@ -781,7 +869,7 @@ async def receive_recipient(message: Message, state: FSMContext, bot: Bot):
 
 
 # ============================================================
-# تأیید/رد/انجام سفارش
+# ۷) تأیید/رد/انجام سفارش
 # ============================================================
 @router.callback_query(F.data.startswith("approve:"))
 async def cb_approve_order(call: CallbackQuery, bot: Bot):
