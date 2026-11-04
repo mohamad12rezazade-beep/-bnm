@@ -19,7 +19,6 @@ from aiogram.types import (
     CallbackQuery,
     ReplyKeyboardMarkup,
     KeyboardButton,
-    InlineKeyboardMarkup,
     Contact,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
@@ -58,6 +57,121 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# ---------- SQL خودکارسازی دیتابیس ----------
+INIT_SQL = """
+CREATE TABLE IF NOT EXISTS users (
+    user_id BIGINT PRIMARY KEY,
+    username TEXT,
+    full_name TEXT,
+    phone TEXT UNIQUE,
+    balance INTEGER NOT NULL DEFAULT 0,
+    referrer_id BIGINT,
+    referrer_rewarded BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE users ADD COLUMN IF NOT EXISTS balance INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS referrer_id BIGINT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS referrer_rewarded BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS full_name TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+CREATE TABLE IF NOT EXISTS orders (
+    order_id TEXT PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    gift_name TEXT NOT NULL,
+    gift_price INTEGER NOT NULL CHECK (gift_price > 0),
+    recipient TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected','completed')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    published BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS published BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+CREATE TABLE IF NOT EXISTS referrals (
+    id BIGSERIAL PRIMARY KEY,
+    referrer_id BIGINT NOT NULL,
+    referred_id BIGINT NOT NULL UNIQUE,
+    rewarded BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS transactions (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    amount INTEGER NOT NULL,
+    type TEXT NOT NULL,
+    description TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_users_phone ON users(phone);
+CREATE INDEX IF NOT EXISTS idx_users_referrer ON users(referrer_id);
+CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id);
+CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
+CREATE INDEX IF NOT EXISTS idx_transactions_user ON transactions(user_id);
+
+CREATE OR REPLACE FUNCTION create_order_atomic(
+    p_order_id TEXT,
+    p_user_id BIGINT,
+    p_gift_name TEXT,
+    p_gift_price INTEGER,
+    p_recipient TEXT
+) RETURNS BOOLEAN AS $$
+DECLARE
+    v_balance INTEGER;
+BEGIN
+    SELECT balance INTO v_balance FROM users WHERE user_id = p_user_id FOR UPDATE;
+    IF v_balance IS NULL OR v_balance < p_gift_price THEN
+        RETURN FALSE;
+    END IF;
+    UPDATE users SET balance = balance - p_gift_price WHERE user_id = p_user_id;
+    INSERT INTO orders(order_id, user_id, gift_name, gift_price, recipient, status)
+    VALUES (p_order_id, p_user_id, p_gift_name, p_gift_price, p_recipient, 'pending');
+    INSERT INTO transactions(user_id, amount, type, description)
+    VALUES (p_user_id, -p_gift_price, 'purchase', 'خرید ' || p_gift_name);
+    RETURN TRUE;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION reject_order_atomic(p_order_id TEXT) RETURNS BOOLEAN AS $$
+DECLARE
+    v_order orders%ROWTYPE;
+BEGIN
+    SELECT * INTO v_order FROM orders WHERE order_id = p_order_id AND status = 'pending' FOR UPDATE;
+    IF NOT FOUND THEN RETURN FALSE; END IF;
+    UPDATE orders SET status = 'rejected', updated_at = NOW() WHERE order_id = p_order_id;
+    UPDATE users SET balance = balance + v_order.gift_price WHERE user_id = v_order.user_id;
+    INSERT INTO transactions(user_id, amount, type, description)
+    VALUES (v_order.user_id, v_order.gift_price, 'refund', 'بازگشت وجه رد سفارش ' || p_order_id);
+    RETURN TRUE;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION reward_referrer_atomic(p_referred_id BIGINT) RETURNS BOOLEAN AS $$
+DECLARE
+    v_referrer_id BIGINT;
+BEGIN
+    SELECT referrer_id INTO v_referrer_id FROM users
+    WHERE user_id = p_referred_id AND referrer_rewarded = FALSE FOR UPDATE;
+    IF v_referrer_id IS NULL THEN RETURN FALSE; END IF;
+    UPDATE users SET referrer_rewarded = TRUE WHERE user_id = p_referred_id;
+    UPDATE users SET balance = balance + 2 WHERE user_id = v_referrer_id;
+    INSERT INTO referrals(referrer_id, referred_id, rewarded)
+    VALUES (v_referrer_id, p_referred_id, TRUE)
+    ON CONFLICT DO NOTHING;
+    INSERT INTO transactions(user_id, amount, type, description)
+    VALUES (v_referrer_id, 2, 'invite_reward', 'پاداش دعوت کاربر ' || p_referred_id);
+    RETURN TRUE;
+END;
+$$ LANGUAGE plpgsql;
+"""
+
+
 # ---------- دیتابیس ----------
 class Database:
     def __init__(self):
@@ -71,7 +185,9 @@ class Database:
         )
         async with self.pool.acquire() as conn:
             await conn.execute("SELECT 1")
-        logger.info("دیتابیس متصل شد")
+            logger.info("دیتابیس متصل شد، در حال ساخت جدول‌ها...")
+            await conn.execute(INIT_SQL)
+            logger.info("✅ جدول‌ها و ستون‌ها با موفقیت آماده شدند")
 
     async def close(self):
         if self.pool:
@@ -255,9 +371,6 @@ async def check_membership(bot: Bot, user_id: int) -> list[str]:
 router = Router()
 
 
-# =====================================================
-# ۱) COMMAND START
-# =====================================================
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext, bot: Bot):
     await state.clear()
@@ -294,9 +407,6 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot):
     await message.answer("منوی اصلی:", reply_markup=main_menu_keyboard())
 
 
-# =====================================================
-# ۲) هندلرهای منوی اصلی — قبل از هر state دیگری
-# =====================================================
 @router.message(F.text == BTN_INVITE)
 async def show_invite_link(message: Message, bot: Bot, state: FSMContext):
     await state.clear()
@@ -345,9 +455,6 @@ async def show_balance(message: Message, state: FSMContext):
         await message.answer("خطا در دریافت موجودی. لطفاً دوباره تلاش کنید.")
 
 
-# =====================================================
-# ۳) دریافت شماره موبایل
-# =====================================================
 @router.message(F.contact)
 async def handle_contact(message: Message, state: FSMContext, bot: Bot):
     user_id = message.from_user.id
@@ -409,9 +516,6 @@ async def handle_contact(message: Message, state: FSMContext, bot: Bot):
     await state.clear()
 
 
-# =====================================================
-# ۴) CALLBACK های عمومی و عضویت
-# =====================================================
 @router.callback_query(F.data == "check_membership")
 async def cb_check_membership(call: CallbackQuery, bot: Bot):
     missing = await check_membership(bot, call.from_user.id)
@@ -441,9 +545,6 @@ async def cb_main_menu(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
-# =====================================================
-# ۵) انتخاب گیفت (inline callback)
-# =====================================================
 @router.callback_query(F.data.startswith("gift:"))
 async def cb_select_gift(call: CallbackQuery, state: FSMContext, bot: Bot):
     try:
@@ -503,9 +604,6 @@ async def cb_select_gift(call: CallbackQuery, state: FSMContext, bot: Bot):
             pass
 
 
-# =====================================================
-# ۶) تأیید نهایی خرید
-# =====================================================
 @router.callback_query(F.data == "confirm_purchase", BuyGift.confirming)
 async def cb_confirm_purchase(call: CallbackQuery, state: FSMContext, bot: Bot):
     try:
@@ -575,12 +673,8 @@ async def cb_confirm_purchase(call: CallbackQuery, state: FSMContext, bot: Bot):
             pass
 
 
-# =====================================================
-# ۷) STATE ها — آخر از همه
-# =====================================================
 @router.message(BuyGift.waiting_recipient)
 async def receive_recipient(message: Message, state: FSMContext, bot: Bot):
-    # اگه کاربر دکمه منو رو زد (state گیر کرده)، ریست کن و به هندلر منو بفرست
     if message.text in MENU_TEXTS:
         await state.clear()
         if message.text == BTN_BUY:
@@ -624,9 +718,6 @@ async def receive_recipient(message: Message, state: FSMContext, bot: Bot):
     )
 
 
-# =====================================================
-# ۸) ادمین: تأیید / رد / انجام
-# =====================================================
 @router.callback_query(F.data.startswith("approve:"))
 async def cb_approve_order(call: CallbackQuery, bot: Bot):
     if call.from_user.id != ADMIN_ID:
@@ -727,9 +818,6 @@ async def cb_complete_order(call: CallbackQuery, bot: Bot):
         await call.answer("خطا رخ داد", show_alert=True)
 
 
-# =====================================================
-# ۹) MAIN
-# =====================================================
 async def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN تنظیم نشده است")
@@ -739,11 +827,6 @@ async def main():
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-
-    logger.info(
-        f"روتر ثبت شد: {len(dp.message.handlers)} پیام، "
-        f"{len(dp.callback_query.handlers)} callback"
-    )
 
     me = await bot.get_me()
     logger.info(f"ربات متصل شد: @{me.username}")
