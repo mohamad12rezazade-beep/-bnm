@@ -317,7 +317,6 @@ class BuyGift(StatesGroup):
     waiting_recipient = State()
     confirming = State()
 
-# ⚠️ State های ادمین
 class AdminStates(StatesGroup):
     waiting_user_id = State()
     waiting_amount = State()
@@ -413,7 +412,7 @@ async def process_referral(bot: Bot, user_id: int):
 router = Router()
 
 # ============================================================
-# ۱) ادمین: هندلرهای اصلی (بالاترین اولویت)
+# ۱) ادمین: /admin و callback ها
 # ============================================================
 
 @router.message(Command("admin"))
@@ -470,12 +469,16 @@ async def cb_admin_stats(call: CallbackQuery):
         await call.message.answer(text, parse_mode="Markdown", reply_markup=admin_panel_keyboard())
     await call.answer()
 
+# ============================================================
+# ۲) ادمین: دریافت آیدی و مقدار (با اولویت بالا)
+# ============================================================
+
 @router.message(AdminStates.waiting_user_id)
 async def admin_get_user_id(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
     text = (message.text or "").strip()
-    logger.info(f"📝 آیدی خام: {repr(text)}")
+    logger.info(f"📝 آیدی خام دریافتی: {repr(text)}")
     try:
         target_id = int(text)
     except (ValueError, TypeError):
@@ -498,7 +501,7 @@ async def admin_get_amount(message: Message, state: FSMContext, bot: Bot):
     if message.from_user.id != ADMIN_ID:
         return
     text = (message.text or "").strip()
-    logger.info(f"💵 مقدار خام: {repr(text)}")
+    logger.info(f"💵 مقدار خام دریافتی: {repr(text)}")
     try:
         amount = int(text)
         if amount <= 0:
@@ -544,9 +547,8 @@ async def admin_get_amount(message: Message, state: FSMContext, bot: Bot):
 
     await state.clear()
 
-
 # ============================================================
-# ۲) استارت
+# ۳) استارت
 # ============================================================
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext, bot: Bot):
@@ -589,9 +591,8 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot):
     await process_referral(bot, user_id)
     await message.answer("منوی اصلی:", reply_markup=main_menu_keyboard())
 
-
 # ============================================================
-# ۳) دریافت شماره
+# ۴) شماره
 # ============================================================
 @router.message(F.contact)
 async def handle_contact(message: Message, state: FSMContext, bot: Bot):
@@ -644,9 +645,8 @@ async def handle_contact(message: Message, state: FSMContext, bot: Bot):
         )
     await state.clear()
 
-
 # ============================================================
-# ۴) بررسی عضویت
+# ۵) بررسی عضویت / منوی اصلی
 # ============================================================
 @router.callback_query(F.data == "check_membership")
 async def cb_check_membership(call: CallbackQuery, bot: Bot):
@@ -679,9 +679,8 @@ async def cb_main_menu(call: CallbackQuery, state: FSMContext):
     await call.message.answer("منوی اصلی:", reply_markup=main_menu_keyboard())
     await call.answer()
 
-
 # ============================================================
-# ۵) منوهای کاربر (با چک state ادمین)
+# ۶) منوهای کاربر (با چک state ادمین)
 # ============================================================
 async def _is_admin_busy(state: FSMContext) -> bool:
     cur = await state.get_state()
@@ -738,9 +737,8 @@ async def show_balance(message: Message, state: FSMContext):
         logger.exception(f"خطا در show_balance: {e}")
         await message.answer("خطا در دریافت موجودی. لطفاً دوباره تلاش کنید.")
 
-
 # ============================================================
-# ۶) گیفت‌ها
+# ۷) گیفت
 # ============================================================
 @router.callback_query(F.data.startswith("gift:"))
 async def cb_select_gift(call: CallbackQuery, state: FSMContext, bot: Bot):
@@ -867,9 +865,8 @@ async def receive_recipient(message: Message, state: FSMContext, bot: Bot):
         reply_markup=kb.as_markup(),
     )
 
-
 # ============================================================
-# ۷) تأیید/رد/انجام سفارش
+# ۸) سفارش‌ها
 # ============================================================
 @router.callback_query(F.data.startswith("approve:"))
 async def cb_approve_order(call: CallbackQuery, bot: Bot):
