@@ -10,7 +10,7 @@ import asyncpg
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart, Command, BaseFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -55,6 +55,16 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+# ---------- فیلتر امنیتی برای ادمین ----------
+# این فیلتر چک می‌کنه که کاربر تو حالت ادمین نباشه
+class NotInAdminState(BaseFilter):
+    async def __call__(self, message: Message, state: FSMContext) -> bool:
+        current_state = await state.get_state()
+        if current_state and current_state.startswith("AdminStates"):
+            return False
+        return True
 
 
 # ---------- SQL خودکارسازی دیتابیس ----------
@@ -428,7 +438,7 @@ async def process_referral(bot: Bot, user_id: int):
 router = Router()
 
 # ==========================================
-# ادمین: دستور /admin و پنل (اولویت بالا)
+# ۱) ادمین: دستور /admin
 # ==========================================
 @router.message(Command("admin"))
 async def cmd_admin(message: Message, state: FSMContext):
@@ -441,45 +451,9 @@ async def cmd_admin(message: Message, state: FSMContext):
         parse_mode="Markdown",
     )
 
-@router.callback_query(F.data == "admin_stats")
-async def cb_admin_stats(call: CallbackQuery):
-    if call.from_user.id != ADMIN_ID:
-        await call.answer("⛔ دسترسی ندارید", show_alert=True)
-        return
-    stats = await db.get_stats()
-    text = (
-        f"📊 **آمار ربات**\n\n"
-        f"👥 تعداد کاربران: {stats['users']}\n"
-        f"⏳ سفارش‌های در انتظار: {stats['pending']}\n"
-        f"✅ سفارش‌های تکمیل شده: {stats['completed']}\n"
-    )
-    try:
-        await call.message.edit_text(text, parse_mode="Markdown", reply_markup=admin_panel_keyboard())
-    except Exception:
-        await call.message.answer(text, parse_mode="Markdown", reply_markup=admin_panel_keyboard())
-    await call.answer()
-
-@router.callback_query(F.data.in_({"admin_add_balance", "admin_sub_balance"}))
-async def cb_admin_change_balance(call: CallbackQuery, state: FSMContext):
-    if call.from_user.id != ADMIN_ID:
-        await call.answer("⛔ دسترسی ندارید", show_alert=True)
-        return
-    op = call.data
-    await state.update_data(admin_op=op)
-    await state.set_state(AdminStates.waiting_user_id)
-    action = "افزایش" if op == "admin_add_balance" else "کاهش"
-    try:
-        await call.message.edit_text(
-            f"✍️ **{action} استارز**\n\nآیدی عددی کاربر مورد نظر را ارسال کنید:",
-            parse_mode="Markdown",
-        )
-    except Exception:
-        await call.message.answer(
-            f"✍️ **{action} استارز**\n\nآیدی عددی کاربر مورد نظر را ارسال کنید:",
-            parse_mode="Markdown",
-        )
-    await call.answer()
-
+# ==========================================
+# ۲) ادمین: handler های حالت ادمین (اولویت بالا)
+# ==========================================
 @router.message(AdminStates.waiting_user_id)
 async def admin_get_user_id(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
@@ -550,9 +524,50 @@ async def admin_get_amount(message: Message, state: FSMContext, bot: Bot):
 
     await state.clear()
 
+# ==========================================
+# ۳) ادمین: callback ها
+# ==========================================
+@router.callback_query(F.data == "admin_stats")
+async def cb_admin_stats(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("⛔ دسترسی ندارید", show_alert=True)
+        return
+    stats = await db.get_stats()
+    text = (
+        f"📊 **آمار ربات**\n\n"
+        f"👥 تعداد کاربران: {stats['users']}\n"
+        f"⏳ سفارش‌های در انتظار: {stats['pending']}\n"
+        f"✅ سفارش‌های تکمیل شده: {stats['completed']}\n"
+    )
+    try:
+        await call.message.edit_text(text, parse_mode="Markdown", reply_markup=admin_panel_keyboard())
+    except Exception:
+        await call.message.answer(text, parse_mode="Markdown", reply_markup=admin_panel_keyboard())
+    await call.answer()
+
+@router.callback_query(F.data.in_({"admin_add_balance", "admin_sub_balance"}))
+async def cb_admin_change_balance(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("⛔ دسترسی ندارید", show_alert=True)
+        return
+    op = call.data
+    await state.update_data(admin_op=op)
+    await state.set_state(AdminStates.waiting_user_id)
+    action = "افزایش" if op == "admin_add_balance" else "کاهش"
+    try:
+        await call.message.edit_text(
+            f"✍️ **{action} استارز**\n\nآیدی عددی کاربر مورد نظر را ارسال کنید:",
+            parse_mode="Markdown",
+        )
+    except Exception:
+        await call.message.answer(
+            f"✍️ **{action} استارز**\n\nآیدی عددی کاربر مورد نظر را ارسال کنید:",
+            parse_mode="Markdown",
+        )
+    await call.answer()
 
 # ==========================================
-# استارت و ربات اصلی
+# ۴) استارت
 # ==========================================
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext, bot: Bot):
@@ -595,6 +610,9 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot):
     await process_referral(bot, user_id)
     await message.answer("منوی اصلی:", reply_markup=main_menu_keyboard())
 
+# ==========================================
+# ۵) هندلرهای کاربر عادی (با فیلتر NotInAdminState)
+# ==========================================
 @router.message(F.contact)
 async def handle_contact(message: Message, state: FSMContext, bot: Bot):
     user_id = message.from_user.id
@@ -678,7 +696,7 @@ async def cb_main_menu(call: CallbackQuery, state: FSMContext):
     await call.message.answer("منوی اصلی:", reply_markup=main_menu_keyboard())
     await call.answer()
 
-@router.message(F.text == BTN_INVITE)
+@router.message(F.text == BTN_INVITE, NotInAdminState())
 async def show_invite_link(message: Message, bot: Bot, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
@@ -695,12 +713,12 @@ async def show_invite_link(message: Message, bot: Bot, state: FSMContext):
         parse_mode="Markdown",
     )
 
-@router.message(F.text == BTN_BUY)
+@router.message(F.text == BTN_BUY, NotInAdminState())
 async def show_gifts(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("یک گیفت انتخاب کنید:", reply_markup=gift_keyboard())
 
-@router.message(F.text == BTN_BALANCE)
+@router.message(F.text == BTN_BALANCE, NotInAdminState())
 async def show_balance(message: Message, state: FSMContext):
     await state.clear()
     try:
@@ -723,6 +741,9 @@ async def show_balance(message: Message, state: FSMContext):
         logger.exception(f"خطا در show_balance: {e}")
         await message.answer("خطا در دریافت موجودی. لطفاً دوباره تلاش کنید.")
 
+# ==========================================
+# ۶) گیفت و سفارش (کاربر عادی)
+# ==========================================
 @router.callback_query(F.data.startswith("gift:"))
 async def cb_select_gift(call: CallbackQuery, state: FSMContext, bot: Bot):
     try:
@@ -848,6 +869,9 @@ async def receive_recipient(message: Message, state: FSMContext, bot: Bot):
         reply_markup=kb.as_markup(),
     )
 
+# ==========================================
+# ۷) تأیید/رد/انجام سفارش
+# ==========================================
 @router.callback_query(F.data.startswith("approve:"))
 async def cb_approve_order(call: CallbackQuery, bot: Bot):
     if call.from_user.id != ADMIN_ID:
