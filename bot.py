@@ -10,11 +10,13 @@ import asyncpg
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, Contact
+from aiogram.types import (
+    Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, Contact
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
 # ---------------- تنظیمات ----------------
@@ -52,7 +54,7 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 
-# ---------------- ساختار دیتابیس ----------------
+# ---------------- دیتابیس ----------------
 INIT_SQL = """
 CREATE TABLE IF NOT EXISTS users (
     user_id BIGINT PRIMARY KEY,
@@ -229,11 +231,10 @@ class Database:
             return False
         async with self.pool.acquire() as conn:
             async with conn.transaction():
-                exists = await conn.fetchval(
+                if not await conn.fetchval(
                     "SELECT EXISTS(SELECT 1 FROM users WHERE user_id=$1)",
                     referrer_id
-                )
-                if not exists:
+                ):
                     return False
                 await conn.execute("""
                     INSERT INTO users(user_id,referrer_id) VALUES($1,$2)
@@ -324,33 +325,48 @@ class Database:
             value = await conn.fetchval(
                 "SELECT balance FROM users WHERE user_id=$1", user_id
             )
-            return value or 0
+            return int(value or 0)
 
-    async def add_balance(self, user_id, amount):
-        if amount == 0:
-            return False
+    # اصلاح اصلی: مقدار موجودی جدید را برمی‌گرداند و تراکنش را اتمیک ثبت می‌کند.
+    async def add_balance(self, user_id: int, amount: int):
+        if not isinstance(user_id, int) or user_id <= 0:
+            raise ValueError("شناسه کاربر نامعتبر است")
+        if not isinstance(amount, int) or amount == 0:
+            raise ValueError("مبلغ تغییر موجودی نامعتبر است")
+        max_int = 2_147_483_647
+        if abs(amount) > max_int:
+            raise ValueError("مبلغ بیش از محدوده مجاز است")
+
         async with self.pool.acquire() as conn:
             async with conn.transaction():
-                row = await conn.fetchrow(
-                    "SELECT balance FROM users WHERE user_id=$1 FOR UPDATE",
-                    user_id
-                )
-                if not row:
+                row = await conn.fetchrow("""
+                    SELECT COALESCE(balance,0) AS balance
+                    FROM users WHERE user_id=$1 FOR UPDATE
+                """, user_id)
+                if row is None:
                     return False
-                old = row["balance"] or 0
-                new = max(0, old + amount)
-                actual = new - old
+
+                old_balance = int(row["balance"])
+                new_balance = old_balance + amount
+                if new_balance < 0:
+                    raise ValueError(
+                        f"موجودی کافی نیست؛ موجودی فعلی {old_balance} است"
+                    )
+                if new_balance > max_int:
+                    raise ValueError("موجودی از محدوده مجاز دیتابیس بیشتر می‌شود")
+
+                actual = new_balance - old_balance
                 await conn.execute(
                     "UPDATE users SET balance=$1 WHERE user_id=$2",
-                    new, user_id
+                    new_balance, user_id
                 )
-                if actual:
-                    desc = "افزایش توسط ادمین" if actual > 0 else "کاهش توسط ادمین"
-                    await conn.execute("""
-                        INSERT INTO transactions(user_id,amount,type,description)
-                        VALUES($1,$2,'admin_adjust',$3)
-                    """, user_id, actual, desc)
-                return True
+                await conn.execute("""
+                    INSERT INTO transactions(user_id,amount,type,description)
+                    VALUES($1,$2,'admin_adjust',$3)
+                """, user_id, actual,
+                    "افزایش موجودی توسط ادمین" if actual > 0
+                    else "کاهش موجودی توسط ادمین")
+                return new_balance
 
     async def get_transactions(self, user_id, limit=20):
         async with self.pool.acquire() as conn:
@@ -397,10 +413,8 @@ def phone_keyboard():
 def gift_keyboard():
     kb = InlineKeyboardBuilder()
     for key, gift in GIFTS.items():
-        kb.button(
-            text=f"{gift['name']} — {gift['price']} استارز",
-            callback_data=f"gift:{key}"
-        )
+        kb.button(text=f"{gift['name']} — {gift['price']} استارز",
+                  callback_data=f"gift:{key}")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -465,9 +479,7 @@ async def process_referral(bot, user_id):
     user = await db.get_user(user_id)
     if not user or not user["phone"] or not user["referrer_id"]:
         return
-    if user["referrer_rewarded"]:
-        return
-    if await check_membership(bot, user_id):
+    if user["referrer_rewarded"] or await check_membership(bot, user_id):
         return
     if await db.try_reward_referrer(user_id):
         try:
@@ -479,7 +491,7 @@ async def process_referral(bot, user_id):
             logger.exception("ارسال پیام پاداش معرف ناموفق بود")
 
 
-# ---------------- ادمین ----------------
+# ---------------- پنل ادمین ----------------
 @router.message(Command("admin"))
 async def cmd_admin(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
@@ -518,11 +530,9 @@ async def cb_admin_stats(call: CallbackQuery):
         async with db.pool.acquire() as conn:
             users = await conn.fetchval("SELECT COUNT(*) FROM users")
             pending = await conn.fetchval(
-                "SELECT COUNT(*) FROM orders WHERE status='pending'"
-            )
+                "SELECT COUNT(*) FROM orders WHERE status='pending'")
             completed = await conn.fetchval(
-                "SELECT COUNT(*) FROM orders WHERE status='completed'"
-            )
+                "SELECT COUNT(*) FROM orders WHERE status='completed'")
         text = (
             "📊 <b>آمار ربات</b>\n\n"
             f"👥 کاربران: {users}\n"
@@ -543,25 +553,37 @@ async def cb_admin_stats(call: CallbackQuery):
 async def admin_get_user_id(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
-    try:
-        target_id = int((message.text or "").strip())
-        if target_id <= 0:
-            raise ValueError
-    except ValueError:
+    raw_id = (message.text or "").strip()
+    if not raw_id.isdigit():
         await message.answer("❌ آیدی نامعتبر است؛ فقط عدد مثبت بفرستید.")
         return
-
-    target = await db.get_user(target_id)
-    if not target:
-        await message.answer("❌ کاربری با این آیدی در ربات ثبت نشده است.")
+    target_id = int(raw_id)
+    if target_id <= 0 or target_id > 9_223_372_036_854_775_807:
+        await message.answer("❌ آیدی خارج از محدوده مجاز است.")
         return
-
+    try:
+        target = await db.get_user(target_id)
+    except Exception:
+        logger.exception("خطا در خواندن کاربر: user_id=%s", target_id)
+        await message.answer("❌ خطا در ارتباط با دیتابیس هنگام پیدا کردن کاربر.")
+        return
+    if target is None:
+        await message.answer(
+            "❌ این کاربر هنوز در ربات ثبت نشده است.\n"
+            "کاربر باید حداقل یک‌بار ربات را /start کرده باشد."
+        )
+        return
+    data = await state.get_data()
+    if data.get("admin_op") not in ("admin_add", "admin_sub"):
+        await state.clear()
+        await message.answer("❌ عملیات ادمین منقضی شده؛ دوباره /admin را بزنید.")
+        return
     await state.update_data(target_id=target_id)
     await state.set_state(AdminStates.waiting_amount)
     await message.answer(
         f"👤 کاربر: {target['full_name'] or '-'}\n"
         f"🆔 آیدی: {target_id}\n"
-        f"⭐ موجودی فعلی: {target['balance']}\n\n"
+        f"⭐ موجودی فعلی: {target['balance'] or 0}\n\n"
         "مبلغ را به صورت عدد مثبت ارسال کنید:"
     )
 
@@ -570,70 +592,71 @@ async def admin_get_user_id(message: Message, state: FSMContext):
 async def admin_get_amount(message: Message, state: FSMContext, bot: Bot):
     if message.from_user.id != ADMIN_ID:
         return
-    try:
-        amount = int((message.text or "").strip())
-        if amount <= 0:
-            raise ValueError
-    except ValueError:
-        await message.answer("❌ مبلغ باید عدد مثبت باشد.")
+    raw = (message.text or "").strip().replace(",", "").replace("٬", "")
+    if not raw.isdigit():
+        await message.answer("❌ مبلغ باید عدد صحیح و مثبت باشد.")
         return
-
+    amount = int(raw)
+    if amount <= 0 or amount > 2_147_483_647:
+        await message.answer("❌ مبلغ باید بین ۱ تا ۲٬۱۴۷٬۴۸۳٬۶۴۷ باشد.")
+        return
     data = await state.get_data()
     target_id = data.get("target_id")
     operation = data.get("admin_op")
-
-    if not target_id or operation not in ("admin_add", "admin_sub"):
+    if not isinstance(target_id, int) or operation not in ("admin_add", "admin_sub"):
         await state.clear()
         await message.answer("❌ اطلاعات عملیات ناقص است؛ دوباره /admin بزنید.")
         return
-
     signed = amount if operation == "admin_add" else -amount
-
     try:
-        if not await db.add_balance(target_id, signed):
-            await state.clear()
-            await message.answer("❌ کاربر پیدا نشد.")
+        new_balance = await db.add_balance(target_id, signed)
+        if new_balance is False:
+            await message.answer("❌ کاربر در دیتابیس پیدا نشد.")
             return
-
-        new_balance = await db.get_balance(target_id)
         action = "افزایش" if signed > 0 else "کاهش"
-
         await message.answer(
-            f"✅ <b>{action} موجودی انجام شد</b>\n\n"
+            f"✅ <b>{action} موجودی با موفقیت انجام شد</b>\n\n"
             f"کاربر: <code>{target_id}</code>\n"
-            f"تغییر: {signed:+d} استارز\n"
-            f"موجودی جدید: {new_balance} استارز",
+            f"تغییر: {signed:+,} استارز\n"
+            f"موجودی جدید: <b>{new_balance:,}</b> استارز",
             reply_markup=admin_panel_keyboard()
         )
-
         try:
             await bot.send_message(
                 target_id,
-                f"🎁 موجودی شما تغییر کرد.\n"
-                f"تغییر: {signed:+d} استارز\n"
-                f"موجودی جدید: {new_balance}"
+                "🎁 موجودی شما توسط مدیریت تغییر کرد.\n"
+                f"تغییر: {signed:+,} استارز\n"
+                f"موجودی جدید: {new_balance:,} استارز"
             )
         except Exception:
-            logger.warning("ارسال اعلان تغییر موجودی ناموفق بود")
-
+            logger.exception(
+                "موجودی تغییر کرد اما اعلان ارسال نشد: user_id=%s", target_id
+            )
+    except ValueError as exc:
+        await message.answer(f"❌ {exc}")
     except Exception:
-        logger.exception("خطای تغییر موجودی ادمین")
-        await message.answer("❌ خطا در تغییر موجودی؛ لاگ GitHub Actions را بررسی کنید.")
+        logger.exception(
+            "خطای دیتابیس در تغییر موجودی: admin=%s target=%s amount=%s",
+            message.from_user.id, target_id, signed
+        )
+        await message.answer(
+            "❌ عملیات دیتابیس ناموفق بود.\n"
+            "جزئیات کامل خطا در GitHub Actions ثبت شده است."
+        )
     finally:
         await state.clear()
 
 
-# ---------------- استارت ----------------
+# ---------------- شروع ----------------
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext, bot: Bot):
     await state.clear()
     user_id = message.from_user.id
     args = (message.text or "").split(maxsplit=1)
-
     if len(args) > 1 and args[1].startswith("ref_"):
         try:
             referrer_id = int(args[1][4:])
-            if referrer_id != user_id and referrer_id > 0:
+            if referrer_id > 0 and referrer_id != user_id:
                 saved = await db.set_referrer(user_id, referrer_id)
                 logger.info("Referral user=%s referrer=%s saved=%s",
                             user_id, referrer_id, saved)
@@ -649,7 +672,6 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot):
             reply_markup=phone_keyboard()
         )
         return
-
     missing = await check_membership(bot, user_id)
     if missing:
         await message.answer(
@@ -657,7 +679,6 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot):
             reply_markup=channels_keyboard()
         )
         return
-
     await process_referral(bot, user_id)
     await message.answer("منوی اصلی:", reply_markup=main_menu_keyboard())
 
@@ -667,11 +688,9 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot):
 async def handle_contact(message: Message, state: FSMContext, bot: Bot):
     contact: Contact = message.contact
     user_id = message.from_user.id
-
     if contact.user_id != user_id:
         await message.answer("❌ فقط شماره موبایل خودتان را ارسال کنید.")
         return
-
     phone = re.sub(r"[ ()-]", "", contact.phone_number)
     if phone.startswith("0"):
         phone = "+98" + phone[1:]
@@ -679,26 +698,19 @@ async def handle_contact(message: Message, state: FSMContext, bot: Bot):
         phone = "+" + phone
     elif not phone.startswith("+"):
         phone = "+98" + phone
-
     if not re.fullmatch(r"\+989\d{9}", phone):
         await message.answer("❌ فرمت شماره معتبر نیست.")
         return
-
     existing = await db.get_user_by_phone(phone)
     if existing and existing["user_id"] != user_id:
         await message.answer("❌ این شماره قبلاً ثبت شده است.")
         return
-
     user = await db.get_user(user_id)
     referrer_id = user["referrer_id"] if user else None
-
     try:
         await db.upsert_user(
-            user_id,
-            message.from_user.username,
-            message.from_user.full_name,
-            phone,
-            referrer_id
+            user_id, message.from_user.username,
+            message.from_user.full_name, phone, referrer_id
         )
     except asyncpg.UniqueViolationError:
         await message.answer("❌ این شماره قبلاً ثبت شده است.")
@@ -707,7 +719,6 @@ async def handle_contact(message: Message, state: FSMContext, bot: Bot):
         logger.exception("خطا در ثبت شماره")
         await message.answer("❌ خطا در ثبت شماره؛ دوباره تلاش کنید.")
         return
-
     missing = await check_membership(bot, user_id)
     if missing:
         await message.answer(
@@ -723,19 +734,17 @@ async def handle_contact(message: Message, state: FSMContext, bot: Bot):
     await state.clear()
 
 
-# ---------------- بررسی عضویت ----------------
+# ---------------- بررسی عضویت و منو ----------------
 @router.callback_query(F.data == "check_membership")
 async def cb_check_membership(call: CallbackQuery, bot: Bot):
     user = await db.get_user(call.from_user.id)
     if not user or not user["phone"]:
         await call.answer("ابتدا شماره موبایل را تأیید کنید.", show_alert=True)
         return
-
     missing = await check_membership(bot, call.from_user.id)
     if missing:
         await call.answer("هنوز عضو همه کانال‌ها نشده‌اید.", show_alert=True)
         return
-
     await process_referral(bot, call.from_user.id)
     try:
         await call.message.delete()
@@ -759,7 +768,6 @@ async def cb_main_menu(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
-# ---------------- منوها ----------------
 async def admin_busy(state: FSMContext):
     current = await state.get_state()
     return bool(current and current.startswith("AdminStates"))
@@ -819,7 +827,7 @@ async def show_balance(message: Message, state: FSMContext):
         await message.answer("❌ خطا در دریافت موجودی.")
 
 
-# ---------------- انتخاب گیفت ----------------
+# ---------------- خرید گیفت ----------------
 @router.callback_query(F.data.startswith("gift:"))
 async def cb_select_gift(call: CallbackQuery, state: FSMContext):
     key = call.data.split(":", 1)[1]
@@ -827,12 +835,10 @@ async def cb_select_gift(call: CallbackQuery, state: FSMContext):
     if not gift:
         await call.answer("گیفت نامعتبر است.", show_alert=True)
         return
-
     user = await db.get_user(call.from_user.id)
     if not user or not user["phone"]:
         await call.answer("ابتدا شماره موبایل را تأیید کنید.", show_alert=True)
         return
-
     balance = await db.get_balance(call.from_user.id)
     if balance < gift["price"]:
         await call.answer(
@@ -840,11 +846,8 @@ async def cb_select_gift(call: CallbackQuery, state: FSMContext):
             show_alert=True
         )
         return
-
     await state.update_data(
-        gift_key=key,
-        gift_price=gift["price"],
-        gift_name=gift["name"]
+        gift_key=key, gift_price=gift["price"], gift_name=gift["name"]
     )
     await state.set_state(BuyGift.waiting_recipient)
     text = (
@@ -869,26 +872,21 @@ async def receive_recipient(message: Message, state: FSMContext, bot: Bot):
         else:
             await show_invite_link(message, bot, state)
         return
-
     recipient = (message.text or "").strip()
     if not recipient or len(recipient) > 100:
         await message.answer("❌ لطفاً یک آیدی معتبر ارسال کنید.")
         return
-
     data = await state.get_data()
     if not all(data.get(k) for k in ("gift_key", "gift_name", "gift_price")):
         await state.clear()
         await message.answer("❌ اطلاعات گیفت پیدا نشد. دوباره شروع کنید.")
         return
-
     await state.update_data(recipient=recipient)
     await state.set_state(BuyGift.confirming)
-
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ تأیید نهایی خرید", callback_data="confirm_purchase")
     kb.button(text="🔙 بازگشت", callback_data="main_menu")
     kb.adjust(1)
-
     await message.answer(
         "📋 <b>پیش‌فاکتور</b>\n\n"
         f"گیفت: {data['gift_name']}\n"
@@ -906,15 +904,12 @@ async def cb_confirm_purchase(call: CallbackQuery, state: FSMContext, bot: Bot):
     price = data.get("gift_price")
     name = data.get("gift_name")
     recipient = data.get("recipient")
-
     if not all((gift_key, price, name, recipient)):
         await state.clear()
         await call.message.edit_text("❌ اطلاعات خرید ناقص است.")
         await call.answer()
         return
-
     order_id = uuid.uuid4().hex[:12].upper()
-
     try:
         success = await db.create_order(
             order_id, call.from_user.id, gift_key, price, recipient
@@ -924,10 +919,11 @@ async def cb_confirm_purchase(call: CallbackQuery, state: FSMContext, bot: Bot):
             await state.clear()
             await call.answer()
             return
-
         user = await db.get_user(call.from_user.id)
-        full_name = user["full_name"] if user and user["full_name"] else call.from_user.full_name
-
+        full_name = (
+            user["full_name"] if user and user["full_name"]
+            else call.from_user.full_name
+        )
         admin_text = (
             "🛒 <b>سفارش جدید</b>\n\n"
             f"شناسه: <code>{order_id}</code>\n"
@@ -937,7 +933,6 @@ async def cb_confirm_purchase(call: CallbackQuery, state: FSMContext, bot: Bot):
             f"قیمت: {price} استارز\n"
             f"تاریخ: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
         )
-
         try:
             await bot.send_message(
                 ADMIN_ID, admin_text,
@@ -945,19 +940,17 @@ async def cb_confirm_purchase(call: CallbackQuery, state: FSMContext, bot: Bot):
             )
         except Exception:
             logger.exception("ارسال سفارش به ادمین ناموفق بود")
-
         await call.message.edit_text(
             f"✅ سفارش ثبت شد.\nشناسه: <code>{order_id}</code>"
         )
         await state.clear()
         await call.answer()
-
     except Exception:
         logger.exception("خطا در ثبت سفارش")
         await call.answer("خطا در ثبت سفارش.", show_alert=True)
 
 
-# ---------------- تأیید سفارش ----------------
+# ---------------- تأیید / رد سفارش ----------------
 @router.callback_query(F.data.startswith("approve:"))
 async def cb_approve_order(call: CallbackQuery):
     if call.from_user.id != ADMIN_ID:
@@ -979,7 +972,6 @@ async def cb_approve_order(call: CallbackQuery):
         await call.answer("خطا در تأیید سفارش.", show_alert=True)
 
 
-# ---------------- رد سفارش ----------------
 @router.callback_query(F.data.startswith("reject:"))
 async def cb_reject_order(call: CallbackQuery, bot: Bot):
     if call.from_user.id != ADMIN_ID:
@@ -998,7 +990,7 @@ async def cb_reject_order(call: CallbackQuery, bot: Bot):
                 f"{order['gift_price']} استارز به حساب شما برگشت."
             )
         except Exception:
-            pass
+            logger.exception("ارسال پیام رد سفارش ناموفق بود")
         await call.message.edit_text((call.message.text or "") + "\n\n❌ رد شد.")
         await call.answer("سفارش رد شد.")
     except Exception:
@@ -1006,24 +998,23 @@ async def cb_reject_order(call: CallbackQuery, bot: Bot):
         await call.answer("خطا در رد سفارش.", show_alert=True)
 
 
-# ---------------- تکمیل و انتشار سفارش ----------------
+# ---------------- تکمیل و انتشار ----------------
 @router.callback_query(F.data.startswith("complete:"))
 async def cb_complete_order(call: CallbackQuery, bot: Bot):
     if call.from_user.id != ADMIN_ID:
         await call.answer("⛔ دسترسی ندارید", show_alert=True)
         return
-
     order_id = call.data.split(":", 1)[1]
-
     try:
         order = await db.get_order(order_id)
         if not order or order["status"] != "approved" or order["published"]:
             await call.answer("سفارش آماده تکمیل نیست.", show_alert=True)
             return
-
         user = await db.get_user(order["user_id"])
-        full_name = user["full_name"] if user and user["full_name"] else str(order["user_id"])
-
+        full_name = (
+            user["full_name"] if user and user["full_name"]
+            else str(order["user_id"])
+        )
         publish_text = (
             "✅ <b>سفارش انجام شد</b>\n\n"
             f"شناسه: <code>{order_id}</code>\n"
@@ -1032,27 +1023,21 @@ async def cb_complete_order(call: CallbackQuery, bot: Bot):
             f"گیرنده: <code>{order['recipient']}</code>\n"
             f"تاریخ: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
         )
-
-        # ابتدا انتشار؛ اگر ارسال ناموفق باشد سفارش تکمیل‌شده علامت نمی‌خورد.
         await bot.send_message(PUBLISH_CHANNEL, publish_text)
-
         if not await db.mark_order_completed(order_id):
             await call.answer("وضعیت سفارش تغییر کرده است.", show_alert=True)
             return
-
         try:
             await bot.send_message(
                 order["user_id"],
                 f"🎉 سفارش <code>{order_id}</code> انجام شد و در کانال منتشر شد."
             )
         except Exception:
-            pass
-
+            logger.exception("ارسال اعلان تکمیل سفارش ناموفق بود")
         await call.message.edit_text(
             (call.message.text or "") + "\n\n📦 انجام و منتشر شد."
         )
         await call.answer("سفارش تکمیل شد.")
-
     except Exception:
         logger.exception("خطای تکمیل سفارش")
         await call.answer("خطا در تکمیل یا انتشار سفارش.", show_alert=True)
@@ -1066,12 +1051,10 @@ async def main():
         raise RuntimeError("DATABASE_URL تنظیم نشده است")
 
     await db.connect()
-
     bot = Bot(
         token=BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML)
     )
-
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
@@ -1079,10 +1062,8 @@ async def main():
         me = await bot.get_me()
         logger.info("ربات فعال شد: @%s", me.username)
         logger.info("ADMIN_ID=%s", ADMIN_ID)
-
         await bot.delete_webhook(drop_pending_updates=True)
         await dp.start_polling(bot)
-
     finally:
         await db.close()
         await bot.session.close()
