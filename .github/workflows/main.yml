@@ -5,21 +5,22 @@ on:
   workflow_dispatch:
 
 jobs:
-  run-bot:
+  bot:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Get code
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Python
+      - name: Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install packages
+      - name: Install
         run: pip install -r requirements.txt
 
-      - name: Start bot
+      - name: Run bot
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
