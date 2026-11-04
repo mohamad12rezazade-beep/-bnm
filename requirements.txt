@@ -1,3 +1,4 @@
-aiogram>=3.13,<4
-asyncpg
-python-dotenv
+
+aiogram==3.18.0
+asyncpg==0.30.0
+python-dotenv==1.0.1
