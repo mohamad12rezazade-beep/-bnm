@@ -20,7 +20,6 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
     KeyboardButton,
     InlineKeyboardMarkup,
-    ReplyKeyboardRemove,
     Contact,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
@@ -46,7 +45,6 @@ GIFTS = {
     "diamond": {"name": "💎 Diamond", "price": 100},
 }
 
-# متن دقیق دکمه‌های منو (تک‌منبع حقیقت)
 BTN_INVITE = "🔗 لینک دعوت"
 BTN_BUY = "🎁 خرید گیفت"
 BTN_BALANCE = "⭐ موجودی استارز"
@@ -257,7 +255,9 @@ async def check_membership(bot: Bot, user_id: int) -> list[str]:
 router = Router()
 
 
-# ---------- شروع ----------
+# =====================================================
+# ۱) COMMAND START
+# =====================================================
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext, bot: Bot):
     await state.clear()
@@ -294,7 +294,60 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot):
     await message.answer("منوی اصلی:", reply_markup=main_menu_keyboard())
 
 
-# ---------- دریافت شماره ----------
+# =====================================================
+# ۲) هندلرهای منوی اصلی — قبل از هر state دیگری
+# =====================================================
+@router.message(F.text == BTN_INVITE)
+async def show_invite_link(message: Message, bot: Bot, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
+    user = await db.get_user(user_id)
+    if not user:
+        await message.answer("لطفاً ابتدا /start را ارسال کنید.")
+        return
+
+    me = await bot.get_me()
+    link = f"https://t.me/{me.username}?start=ref_{user_id}"
+    await message.answer(
+        f"لینک دعوت اختصاصی شما:\n\n`{link}`\n\n"
+        "با دعوت از دوستان خود، پس از تأیید شماره و عضویت آن‌ها، ۲ استارز دریافت می‌کنید.",
+        parse_mode="Markdown",
+    )
+
+
+@router.message(F.text == BTN_BUY)
+async def show_gifts(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("یک گیفت انتخاب کنید:", reply_markup=gift_keyboard())
+
+
+@router.message(F.text == BTN_BALANCE)
+async def show_balance(message: Message, state: FSMContext):
+    await state.clear()
+    try:
+        user_id = message.from_user.id
+        balance = await db.get_balance(user_id)
+        txs = await db.get_transactions(user_id)
+
+        text = f"⭐ موجودی فعلی شما: **{balance}** استارز\n\n"
+        if txs:
+            text += "📋 تاریخچه تراکنش‌ها:\n"
+            for tx in txs:
+                sign = "+" if tx["amount"] > 0 else ""
+                desc = tx["description"] or tx["type"]
+                text += f"• {sign}{tx['amount']} — {desc}\n"
+        else:
+            text += "هنوز تراکنشی ثبت نشده است."
+
+        await message.answer(text, parse_mode="Markdown")
+    except Exception as e:
+        logger.exception(f"خطا در show_balance: {e}")
+        await message.answer("خطا در دریافت موجودی. لطفاً دوباره تلاش کنید.")
+
+
+# =====================================================
+# ۳) دریافت شماره موبایل
+# =====================================================
 @router.message(F.contact)
 async def handle_contact(message: Message, state: FSMContext, bot: Bot):
     user_id = message.from_user.id
@@ -356,7 +409,9 @@ async def handle_contact(message: Message, state: FSMContext, bot: Bot):
     await state.clear()
 
 
-# ---------- بررسی عضویت ----------
+# =====================================================
+# ۴) CALLBACK های عمومی و عضویت
+# =====================================================
 @router.callback_query(F.data == "check_membership")
 async def cb_check_membership(call: CallbackQuery, bot: Bot):
     missing = await check_membership(bot, call.from_user.id)
@@ -375,56 +430,22 @@ async def cb_check_membership(call: CallbackQuery, bot: Bot):
     await call.answer()
 
 
-# ---------- منوی اصلی: لینک دعوت ----------
-@router.message(F.text == BTN_INVITE)
-async def show_invite_link(message: Message, bot: Bot, state: FSMContext):
+@router.callback_query(F.data == "main_menu")
+async def cb_main_menu(call: CallbackQuery, state: FSMContext):
     await state.clear()
-    user_id = message.from_user.id
-    user = await db.get_user(user_id)
-    if not user:
-        await message.answer("لطفاً ابتدا /start را ارسال کنید.")
-        return
-
-    me = await bot.get_me()
-    link = f"https://t.me/{me.username}?start=ref_{user_id}"
-    await message.answer(
-        f"لینک دعوت اختصاصی شما:\n\n`{link}`\n\n"
-        "با دعوت از دوستان خود، پس از تأیید شماره و عضویت آن‌ها، ۲ استارز دریافت می‌کنید.",
-        parse_mode="Markdown",
-    )
+    try:
+        await call.message.delete()
+    except Exception:
+        pass
+    await call.message.answer("منوی اصلی:", reply_markup=main_menu_keyboard())
+    await call.answer()
 
 
-# ---------- منوی اصلی: خرید گیفت ----------
-@router.message(F.text == BTN_BUY)
-async def show_gifts(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer("یک گیفت انتخاب کنید:", reply_markup=gift_keyboard())
-
-
-# ---------- منوی اصلی: موجودی ----------
-@router.message(F.text == BTN_BALANCE)
-async def show_balance(message: Message, state: FSMContext):
-    await state.clear()
-    user_id = message.from_user.id
-    balance = await db.get_balance(user_id)
-    txs = await db.get_transactions(user_id)
-
-    text = f"⭐ موجودی فعلی شما: **{balance}** استارز\n\n"
-    if txs:
-        text += "📋 تاریخچه تراکنش‌ها:\n"
-        for tx in txs:
-            sign = "+" if tx["amount"] > 0 else ""
-            desc = tx["description"] or tx["type"]
-            text += f"• {sign}{tx['amount']} — {desc}\n"
-    else:
-        text += "هنوز تراکنشی ثبت نشده است."
-
-    await message.answer(text, parse_mode="Markdown")
-
-
-# ---------- انتخاب گیفت (اینلاین) ----------
+# =====================================================
+# ۵) انتخاب گیفت (inline callback)
+# =====================================================
 @router.callback_query(F.data.startswith("gift:"))
-async def cb_select_gift(call: CallbackQuery, state: FSMContext):
+async def cb_select_gift(call: CallbackQuery, state: FSMContext, bot: Bot):
     try:
         parts = call.data.split(":", 1)
         if len(parts) < 2:
@@ -455,77 +476,36 @@ async def cb_select_gift(call: CallbackQuery, state: FSMContext):
         )
         await state.set_state(BuyGift.waiting_recipient)
 
+        text = (
+            f"شما {gift['name']} را به قیمت {gift['price']} استارز انتخاب کردید.\n\n"
+            "لطفاً آیدی عددی یا یوزرنیم گیرنده را ارسال کنید:"
+        )
         try:
-            await call.message.edit_text(
-                f"شما {gift['name']} را به قیمت {gift['price']} استارز انتخاب کردید.\n\n"
-                "لطفاً آیدی عددی یا یوزرنیم گیرنده را ارسال کنید:",
-                reply_markup=back_keyboard(),
-            )
+            await call.message.edit_text(text, reply_markup=back_keyboard())
         except Exception as e:
-            logger.warning(f"edit_text failed, sending new message: {e}")
-            await call.message.answer(
-                f"شما {gift['name']} را به قیمت {gift['price']} استارز انتخاب کردید.\n\n"
-                "لطفاً آیدی عددی یا یوزرنیم گیرنده را ارسال کنید:",
-                reply_markup=back_keyboard(),
-            )
+            logger.warning(f"edit_text failed: {e}")
+            await call.message.answer(text, reply_markup=back_keyboard())
 
         await call.answer()
     except Exception as e:
         logger.exception(f"خطا در cb_select_gift: {e}")
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                f"❌ خطا در cb_select_gift:\n`{type(e).__name__}: {e}`",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
         try:
             await call.answer("خطا رخ داد، دوباره تلاش کنید", show_alert=True)
         except Exception:
             pass
 
 
-# ---------- دریافت گیرنده ----------
-@router.message(BuyGift.waiting_recipient)
-async def receive_recipient(message: Message, state: FSMContext, bot: Bot):
-    # اگه کاربر دکمه منو رو زد، state رو ریست کن و به هندلر منو بفرست
-    if message.text in MENU_TEXTS:
-        await state.clear()
-        if message.text == BTN_BUY:
-            await show_gifts(message, state)
-        elif message.text == BTN_BALANCE:
-            await show_balance(message, state)
-        elif message.text == BTN_INVITE:
-            await show_invite_link(message, bot, state)
-        return
-
-    recipient = (message.text or "").strip()
-    if not recipient:
-        await message.answer("لطفاً یک آیدی معتبر ارسال کنید.")
-        return
-
-    data = await state.get_data()
-    gift_name = data.get("gift_name")
-    gift_price = data.get("gift_price")
-    gift_key = data.get("gift_key")
-
-    if not all([gift_name, gift_price, gift_key]):
-        await state.clear()
-        await message.answer("خطا: اطلاعات گیفت پیدا نشد. لطفاً دوباره از منو شروع کنید.")
-        return
-
-    await state.update_data(recipient=recipient)
-    await state.set_state(BuyGift.confirming)
-
-    kb = InlineKeyboardBuilder()
-    kb.button(text="✅ تأیید نهایی خرید", callback_data="confirm_purchase")
-    kb.button(text="🔙 بازگشت", callback_data="main_menu")
-    kb.adjust(1)
-
-    await message.answer(
-        f"📋 پیش‌فاکتور:\n"
-        f"گیفت: {gift_name}\n"
-        f"قیمت: {gift_price} استارز\n"
-        f"گیرنده: {recipient}\n\n"
-        f"آیا تأیید می‌کنید؟",
-        reply_markup=kb.as_markup(),
-    )
-
-
-# ---------- تأیید نهایی خرید ----------
+# =====================================================
+# ۶) تأیید نهایی خرید
+# =====================================================
 @router.callback_query(F.data == "confirm_purchase", BuyGift.confirming)
 async def cb_confirm_purchase(call: CallbackQuery, state: FSMContext, bot: Bot):
     try:
@@ -582,12 +562,71 @@ async def cb_confirm_purchase(call: CallbackQuery, state: FSMContext, bot: Bot):
     except Exception as e:
         logger.exception(f"خطا در cb_confirm_purchase: {e}")
         try:
+            await bot.send_message(
+                ADMIN_ID,
+                f"❌ خطا در confirm_purchase:\n`{type(e).__name__}: {e}`",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+        try:
             await call.answer("خطا رخ داد، دوباره تلاش کنید", show_alert=True)
         except Exception:
             pass
 
 
-# ---------- تأیید سفارش (ادمین) ----------
+# =====================================================
+# ۷) STATE ها — آخر از همه
+# =====================================================
+@router.message(BuyGift.waiting_recipient)
+async def receive_recipient(message: Message, state: FSMContext, bot: Bot):
+    # اگه کاربر دکمه منو رو زد (state گیر کرده)، ریست کن و به هندلر منو بفرست
+    if message.text in MENU_TEXTS:
+        await state.clear()
+        if message.text == BTN_BUY:
+            await show_gifts(message, state)
+        elif message.text == BTN_BALANCE:
+            await show_balance(message, state)
+        elif message.text == BTN_INVITE:
+            await show_invite_link(message, bot, state)
+        return
+
+    recipient = (message.text or "").strip()
+    if not recipient:
+        await message.answer("لطفاً یک آیدی معتبر ارسال کنید.")
+        return
+
+    data = await state.get_data()
+    gift_name = data.get("gift_name")
+    gift_price = data.get("gift_price")
+    gift_key = data.get("gift_key")
+
+    if not all([gift_name, gift_price, gift_key]):
+        await state.clear()
+        await message.answer("خطا: اطلاعات گیفت پیدا نشد. لطفاً دوباره از منو شروع کنید.")
+        return
+
+    await state.update_data(recipient=recipient)
+    await state.set_state(BuyGift.confirming)
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ تأیید نهایی خرید", callback_data="confirm_purchase")
+    kb.button(text="🔙 بازگشت", callback_data="main_menu")
+    kb.adjust(1)
+
+    await message.answer(
+        f"📋 پیش‌فاکتور:\n"
+        f"گیفت: {gift_name}\n"
+        f"قیمت: {gift_price} استارز\n"
+        f"گیرنده: {recipient}\n\n"
+        f"آیا تأیید می‌کنید؟",
+        reply_markup=kb.as_markup(),
+    )
+
+
+# =====================================================
+# ۸) ادمین: تأیید / رد / انجام
+# =====================================================
 @router.callback_query(F.data.startswith("approve:"))
 async def cb_approve_order(call: CallbackQuery, bot: Bot):
     if call.from_user.id != ADMIN_ID:
@@ -610,7 +649,6 @@ async def cb_approve_order(call: CallbackQuery, bot: Bot):
         await call.answer("خطا رخ داد", show_alert=True)
 
 
-# ---------- رد سفارش (ادمین) ----------
 @router.callback_query(F.data.startswith("reject:"))
 async def cb_reject_order(call: CallbackQuery, bot: Bot):
     if call.from_user.id != ADMIN_ID:
@@ -642,7 +680,6 @@ async def cb_reject_order(call: CallbackQuery, bot: Bot):
         await call.answer("خطا رخ داد", show_alert=True)
 
 
-# ---------- ثبت انجام سفارش (ادمین) ----------
 @router.callback_query(F.data.startswith("complete:"))
 async def cb_complete_order(call: CallbackQuery, bot: Bot):
     if call.from_user.id != ADMIN_ID:
@@ -690,19 +727,9 @@ async def cb_complete_order(call: CallbackQuery, bot: Bot):
         await call.answer("خطا رخ داد", show_alert=True)
 
 
-# ---------- بازگشت به منو ----------
-@router.callback_query(F.data == "main_menu")
-async def cb_main_menu(call: CallbackQuery, state: FSMContext):
-    await state.clear()
-    try:
-        await call.message.delete()
-    except Exception:
-        pass
-    await call.message.answer("منوی اصلی:", reply_markup=main_menu_keyboard())
-    await call.answer()
-
-
-# ---------- main ----------
+# =====================================================
+# ۹) MAIN
+# =====================================================
 async def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN تنظیم نشده است")
@@ -722,7 +749,6 @@ async def main():
     logger.info(f"ربات متصل شد: @{me.username}")
 
     await db.connect()
-
     await bot.delete_webhook(drop_pending_updates=True)
 
     try:
