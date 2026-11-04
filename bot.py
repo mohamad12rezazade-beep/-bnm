@@ -1,664 +1,586 @@
-
 import asyncio
+import logging
 import os
 import re
-import logging
-import asyncpg
+import sys
+import uuid
+from datetime import datetime
 
-from aiogram import Bot, Dispatcher, F
+import asyncpg
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message,
     CallbackQuery,
-    KeyboardButton,
     ReplyKeyboardMarkup,
-    InlineKeyboardButton,
+    KeyboardButton,
     InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    ReplyKeyboardRemove,
+    Contact,
 )
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
+from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
-logging.basicConfig(level=logging.INFO)
-
-TOKEN = os.getenv("BOT_TOKEN")
+# ---------- تنظیمات ----------
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
-OWNER_ID = 8935601841
+ADMIN_ID = 8935601841
 
 CHANNELS = [
-    ("@BET_1XZX", "https://t.me/BET_1XZX"),
-    ("@GAP_BAZIN1", "https://t.me/GAP_BAZIN1"),
+    {"username": "@BET_1XZX", "url": "https://t.me/BET_1XZX"},
+    {"username": "@GAP_BAZIN1", "url": "https://t.me/GAP_BAZIN1"},
 ]
+PUBLISH_CHANNEL = "@BET_1XZX"
 
 GIFTS = {
-    "teddy": ("🧸 Teddy", 15),
-    "heart": ("❤️ Heart", 15),
-    "flower": ("🌹 Flower", 25),
-    "gift": ("🎁 Gift", 25),
-    "rocket": ("🚀 Rocket", 50),
-    "cake": ("🎂 Cake", 50),
-    "diamond": ("💎 Diamond", 100),
+    "teddy": {"name": "🧸 Teddy", "price": 15},
+    "heart": {"name": "❤️ Heart", "price": 15},
+    "flower": {"name": "🌹 Flower", "price": 25},
+    "gift": {"name": "🎁 Gift", "price": 25},
+    "rocket": {"name": "🚀 Rocket", "price": 50},
+    "cake": {"name": "🎂 Cake", "price": 50},
+    "diamond": {"name": "💎 Diamond", "price": 100},
 }
 
-if not TOKEN or not DATABASE_URL:
-    raise RuntimeError("BOT_TOKEN یا DATABASE_URL تنظیم نشده است.")
+logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(asctime)s | %(levelname)s | %(message)s")
+logger = logging.getLogger(__name__)
 
-bot = Bot(
-    TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-)
-dp = Dispatcher()
+# ---------- دیتابیس ----------
+class Database:
+    def __init__(self):
+        self.pool: asyncpg.Pool | None = None
 
-db = None
-bot_username = None
-waiting = {}
+    async def connect(self):
+        if not DATABASE_URL:
+            raise RuntimeError("DATABASE_URL تنظیم نشده است")
+        # GitHub Actions در محیط IPv4 نیاز به استفاده از پولینگ دارد، اگر خطا داد از اتصال مستقیم استفاده کنید
+        self.pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5, command_timeout=30)
+        async with self.pool.acquire() as conn:
+            await conn.execute("SELECT 1")
+        logger.info("دیتابیس متصل شد")
 
+    async def close(self):
+        if self.pool:
+            await self.pool.close()
 
-def phone_button():
-    return ReplyKeyboardMarkup(
-        keyboard=[[
-            KeyboardButton(
-                text="📱 تأیید شماره موبایل",
-                request_contact=True
+    async def get_user(self, user_id: int):
+        async with self.pool.acquire() as conn:
+            return await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
+
+    async def get_user_by_phone(self, phone: str):
+        async with self.pool.acquire() as conn:
+            return await conn.fetchrow("SELECT * FROM users WHERE phone = $1", phone)
+
+    async def upsert_user(self, user_id: int, username: str | None, full_name: str, phone: str, referrer_id: int | None = None):
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                existing = await conn.fetchrow("SELECT user_id FROM users WHERE user_id = $1", user_id)
+                if existing:
+                    await conn.execute(
+                        "UPDATE users SET username=$1, full_name=$2, phone=$3 WHERE user_id=$4",
+                        username, full_name, phone, user_id,
+                    )
+                else:
+                    ref = referrer_id if referrer_id != user_id else None
+                    await conn.execute(
+                        "INSERT INTO users(user_id, username, full_name, phone, referrer_id) VALUES($1,$2,$3,$4,$5)",
+                        user_id, username, full_name, phone, ref,
+                    )
+                    if ref:
+                        await conn.execute(
+                            "INSERT INTO referrals(referrer_id, referred_id) VALUES($1,$2) ON CONFLICT DO NOTHING",
+                            ref, user_id,
+                        )
+
+    async def try_reward_referrer(self, user_id: int) -> bool:
+        async with self.pool.acquire() as conn:
+            result = await conn.fetchval("SELECT reward_referrer_atomic($1)", user_id)
+            return bool(result)
+
+    async def create_order(self, order_id: str, user_id: int, gift_key: str, price: int, recipient: str) -> bool:
+        gift_name = GIFTS[gift_key]["name"]
+        async with self.pool.acquire() as conn:
+            result = await conn.fetchval(
+                "SELECT create_order_atomic($1,$2,$3,$4,$5)",
+                order_id, user_id, gift_name, price, recipient,
             )
-        ]],
-        resize_keyboard=True
-    )
+            return bool(result)
 
+    async def reject_order(self, order_id: str) -> bool:
+        async with self.pool.acquire() as conn:
+            result = await conn.fetchval("SELECT reject_order_atomic($1)", order_id)
+            return bool(result)
 
-def menu():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🔗 لینک دعوت")],
-            [KeyboardButton(text="🎁 خرید گیفت")],
-            [KeyboardButton(text="⭐ موجودی استارز")]
-        ],
-        resize_keyboard=True
-    )
+    async def get_order(self, order_id: str):
+        async with self.pool.acquire() as conn:
+            return await conn.fetchrow("SELECT * FROM orders WHERE order_id = $1", order_id)
 
+    async def mark_order_completed(self, order_id: str) -> bool:
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT * FROM orders WHERE order_id=$1 AND status='approved' AND published=FALSE FOR UPDATE",
+                    order_id,
+                )
+                if not row:
+                    return False
+                await conn.execute(
+                    "UPDATE orders SET status='completed', published=TRUE, updated_at=NOW() WHERE order_id=$1",
+                    order_id,
+                )
+                return True
 
-async def setup_database():
-    global db
+    async def approve_order(self, order_id: str) -> bool:
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE orders SET status='approved', updated_at=NOW() WHERE order_id=$1 AND status='pending'",
+                order_id,
+            )
+            return result == "UPDATE 1"
 
-    db = await asyncpg.create_pool(
-        DATABASE_URL,
-        min_size=1,
-        max_size=5,
-        ssl="require"
-    )
+    async def get_balance(self, user_id: int) -> int:
+        async with self.pool.acquire() as conn:
+            val = await conn.fetchval("SELECT balance FROM users WHERE user_id=$1", user_id)
+            return val or 0
 
-    async with db.acquire() as c:
-        await c.execute("""
-        CREATE TABLE IF NOT EXISTS users(
-            user_id BIGINT PRIMARY KEY,
-            username TEXT,
-            phone TEXT,
-            credits INTEGER DEFAULT 0,
-            referred_by BIGINT,
-            referral_paid BOOLEAN DEFAULT FALSE
-        );
+    async def get_transactions(self, user_id: int, limit: int = 20):
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                "SELECT amount, type, description, created_at FROM transactions WHERE user_id=$1 ORDER BY created_at DESC LIMIT $2",
+                user_id, limit,
+            )
 
-        CREATE TABLE IF NOT EXISTS orders(
-            id BIGSERIAL PRIMARY KEY,
-            user_id BIGINT,
-            gift_name TEXT,
-            price INTEGER,
-            recipient TEXT,
-            status TEXT DEFAULT 'pending',
-            created_at TIMESTAMPTZ DEFAULT NOW()
-        );
-        """)
+db = Database()
 
+# ---------- وضعیت‌ها ----------
+class BuyGift(StatesGroup):
+    waiting_recipient = State()
+    confirming = State()
 
-async def save_user(user):
-    async with db.acquire() as c:
-        await c.execute("""
-        INSERT INTO users(user_id, username)
-        VALUES($1,$2)
-        ON CONFLICT(user_id)
-        DO UPDATE SET username=$2
-        """, user.id, user.username)
-
-
-async def get_user(user_id):
-    async with db.acquire() as c:
-        return await c.fetchrow(
-            "SELECT * FROM users WHERE user_id=$1",
-            user_id
-        )
-
-
-def normalize_phone(phone):
-    phone = re.sub(r"[^\d+]", "", phone or "")
-
-    if phone.startswith("0098"):
-        phone = "+98" + phone[4:]
-    elif phone.startswith("98"):
-        phone = "+" + phone
-    elif phone.startswith("09"):
-        phone = "+98" + phone[1:]
-
-    if re.fullmatch(r"\+989\d{9}", phone):
-        return phone
-
-    return None
-
-
-async def is_member(user_id):
-    for channel, _ in CHANNELS:
+# ---------- بررسی عضویت ----------
+async def check_membership(bot: Bot, user_id: int) -> list[str]:
+    missing = []
+    for ch in CHANNELS:
         try:
-            member = await bot.get_chat_member(channel, user_id)
+            member = await bot.get_chat_member(chat_id=ch["username"], user_id=user_id)
             if member.status in ("left", "kicked"):
-                return False
-        except Exception:
-            logging.exception("Membership check failed: %s", channel)
-            return False
+                missing.append(ch["username"])
+        except Exception as e:
+            logger.warning(f"بررسی عضویت کانال {ch['username']} ناموفق: {e}")
+            missing.append(ch["username"])
+    return missing
 
-    return True
+def channels_keyboard():
+    kb = InlineKeyboardBuilder()
+    for ch in CHANNELS:
+        kb.button(text=f"عضویت در {ch['username']}", url=ch["url"])
+    kb.button(text="✅ بررسی عضویت", callback_data="check_membership")
+    kb.adjust(1)
+    return kb.as_markup()
 
+# ---------- کیبوردها ----------
+def main_menu_keyboard():
+    kb = ReplyKeyboardBuilder()
+    kb.button(text="🔗 لینک دعوت")
+    kb.button(text="🎁 خرید گیفت")
+    kb.button(text="⭐ موجودی استارز")
+    kb.adjust(2, 1)
+    return kb.as_markup(resize_keyboard=True)
 
-async def join_message(message):
-    buttons = [
-        [InlineKeyboardButton(
-            text=f"عضویت در {channel}",
-            url=url
-        )]
-        for channel, url in CHANNELS
-    ]
-
-    buttons.append([
-        InlineKeyboardButton(
-            text="✅ بررسی عضویت",
-            callback_data="check"
-        )
-    ])
-
-    await message.answer(
-        "برای استفاده از ربات در هر دو کانال عضو شو:",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=buttons
-        )
+def phone_keyboard():
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📱 تأیید شماره موبایل", request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
     )
+    return kb
 
+def gift_keyboard():
+    kb = InlineKeyboardBuilder()
+    for key, info in GIFTS.items():
+        kb.button(text=f"{info['name']} — {info['price']} اعتبار", callback_data=f"gift:{key}")
+    kb.adjust(1)
+    return kb.as_markup()
 
-async def pay_referral(user_id):
-    async with db.acquire() as c:
-        async with c.transaction():
-            user = await c.fetchrow("""
-            SELECT referred_by, referral_paid
-            FROM users
-            WHERE user_id=$1
-            FOR UPDATE
-            """, user_id)
+def order_admin_keyboard(order_id: str):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ تأیید سفارش", callback_data=f"approve:{order_id}")
+    kb.button(text="❌ رد سفارش", callback_data=f"reject:{order_id}")
+    kb.adjust(2)
+    return kb.as_markup()
 
-            if not user or not user["referred_by"] or user["referral_paid"]:
-                return
+def order_complete_keyboard(order_id: str):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📦 ثبت انجام سفارش", callback_data=f"complete:{order_id}")
+    return kb.as_markup()
 
-            inviter = user["referred_by"]
+def back_keyboard():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔙 بازگشت به منو", callback_data="main_menu")
+    return kb.as_markup()
 
-            await c.execute(
-                "UPDATE users SET credits=credits+2 WHERE user_id=$1",
-                inviter
-            )
+# ---------- روتر ----------
+router = Router()
 
-            await c.execute(
-                "UPDATE users SET referral_paid=TRUE WHERE user_id=$1",
-                user_id
-            )
+@router.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext, bot: Bot):
+    await state.clear()
+    user_id = message.from_user.id
 
-    try:
-        await bot.send_message(
-            inviter,
-            "🎉 دوستت ثبت‌نام کرد. ۲ اعتبار به حسابت اضافه شد."
-        )
-    except Exception:
-        logging.exception("Referral notification failed")
-
-
-async def access(user_id):
-    user = await get_user(user_id)
-
-    if not user or not user["phone"]:
-        return "phone"
-
-    if not await is_member(user_id):
-        return "channels"
-
-    await pay_referral(user_id)
-    return "ok"
-
-
-async def require_access(message):
-    result = await access(message.from_user.id)
-
-    if result == "phone":
-        await message.answer(
-            "ابتدا شماره موبایل خودت رو تأیید کن.",
-            reply_markup=phone_button()
-        )
-        return False
-
-    if result == "channels":
-        await join_message(message)
-        return False
-
-    return True
-
-
-@dp.message(CommandStart())
-async def start(message: Message):
-    await save_user(message.from_user)
-
-    args = (message.text or "").split()
-
+    # بررسی اینکه آیا از طریق لینک دعوت وارد شده است
+    args = message.text.split(maxsplit=1)
+    referrer_id = None
     if len(args) > 1 and args[1].startswith("ref_"):
         try:
-            inviter = int(args[1][4:])
-            if inviter != message.from_user.id:
-                async with db.acquire() as c:
-                    await c.execute("""
-                    UPDATE users
-                    SET referred_by=$1
-                    WHERE user_id=$2
-                    AND phone IS NULL
-                    AND referred_by IS NULL
-                    """, inviter, message.from_user.id)
+            referrer_id = int(args[1][4:])
+            if referrer_id == user_id:
+                referrer_id = None
         except ValueError:
             pass
 
-    user = await get_user(message.from_user.id)
-
-    if not user["phone"]:
+    user = await db.get_user(user_id)
+    if not user:
+        # کاربر جدید، درخواست شماره
+        await state.update_data(referrer_id=referrer_id)
         await message.answer(
-            "سلام 👋\nبرای شروع شماره موبایلت رو تأیید کن.",
-            reply_markup=phone_button()
+            "برای استفاده از ربات، لطفاً شماره موبایل خود را با دکمه زیر تأیید کنید:",
+            reply_markup=phone_keyboard(),
         )
         return
 
-    if await access(message.from_user.id) == "channels":
-        await join_message(message)
-        return
-
-    await message.answer(
-        "به ربات خرید گیفت خوش آمدی 🎁",
-        reply_markup=menu()
-    )
-
-
-@dp.message(F.contact)
-async def contact_handler(message: Message):
-    contact = message.contact
-
-    if contact.user_id != message.from_user.id:
+    # کاربر موجود، بررسی عضویت
+    missing = await check_membership(bot, user_id)
+    if missing:
         await message.answer(
-            "❌ فقط شماره خودت قابل تأییده.",
-            reply_markup=phone_button()
+            f"برای استفاده از ربات، ابتدا در کانال‌های زیر عضو شوید:\n" + "\n".join(missing),
+            reply_markup=channels_keyboard(),
         )
         return
 
-    phone = normalize_phone(contact.phone_number)
+    await message.answer("منوی اصلی:", reply_markup=main_menu_keyboard())
 
-    if not phone:
-        await message.answer(
-            "❌ شماره موبایل ایران معتبر نیست.",
-            reply_markup=phone_button()
-        )
-        return
-
-    async with db.acquire() as c:
-        await c.execute("""
-        UPDATE users SET phone=$1 WHERE user_id=$2
-        """, phone, message.from_user.id)
-
-    if not await is_member(message.from_user.id):
-        await join_message(message)
-        return
-
-    await pay_referral(message.from_user.id)
-
-    await message.answer(
-        "✅ شماره تأیید شد.",
-        reply_markup=menu()
-    )
-
-
-@dp.callback_query(F.data == "check")
-async def check_membership(callback: CallbackQuery):
-    result = await access(callback.from_user.id)
-
-    if result == "phone":
-        await callback.message.answer(
-            "اول شماره موبایلت رو تأیید کن.",
-            reply_markup=phone_button()
-        )
-        await callback.answer()
-        return
-
-    if result == "channels":
-        await callback.answer(
-            "هنوز عضو هر دو کانال نیستی.",
-            show_alert=True
-        )
-        return
-
-    await callback.answer("تأیید شد.")
-    await callback.message.answer(
-        "✅ عضویت تأیید شد.",
-        reply_markup=menu()
-    )
-
-
-@dp.message(F.text == "🔗 لینک دعوت")
-async def referral(message: Message):
-    if not await require_access(message):
-        return
-
-    link = f"https://t.me/{bot_username}?start=ref_{message.from_user.id}"
-
-    await message.answer(
-        "لینک دعوت اختصاصی تو:\n"
-        f"<code>{link}</code>\n\n"
-        "با ثبت‌نام هر دوست و تکمیل عضویت، ۲ اعتبار می‌گیری."
-    )
-
-
-@dp.message(F.text == "⭐ موجودی استارز")
-async def balance(message: Message):
-    if not await require_access(message):
-        return
-
-    user = await get_user(message.from_user.id)
-
-    await message.answer(
-        f"⭐ موجودی شما: <b>{user['credits']}</b> اعتبار"
-    )
-
-
-@dp.message(F.text == "🎁 خرید گیفت")
-async def gifts(message: Message):
-    if not await require_access(message):
-        return
-
-    buttons = []
-
-    for code, (name, price) in GIFTS.items():
-        buttons.append([
-            InlineKeyboardButton(
-                text=f"{name} | {price} اعتبار",
-                callback_data=f"gift:{code}"
-            )
-        ])
-
-    await message.answer(
-        "گیفت مورد نظر رو انتخاب کن:",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=buttons
-        )
-    )
-
-
-@dp.callback_query(F.data.startswith("gift:"))
-async def choose_gift(callback: CallbackQuery):
-    if await access(callback.from_user.id) != "ok":
-        await callback.answer(
-            "ابتدا شماره و عضویت کانال‌ها رو تأیید کن.",
-            show_alert=True
-        )
-        return
-
-    code = callback.data.split(":")[1]
-
-    if code not in GIFTS:
-        await callback.answer("گیفت نامعتبر است.")
-        return
-
-    waiting[callback.from_user.id] = code
-
-    name, price = GIFTS[code]
-
-    await callback.message.answer(
-        f"🎁 {name}\nقیمت: {price} اعتبار\n\n"
-        "آیدی گیرنده رو بفرست:\n"
-        "@username یا شناسه عددی"
-    )
-
-    await callback.answer()
-
-
-@dp.message(F.text)
-async def recipient(message: Message):
+@router.message(F.contact)
+async def handle_contact(message: Message, state: FSMContext, bot: Bot):
+    contact: Contact = message.contact
     user_id = message.from_user.id
 
-    if user_id not in waiting:
+    # بررسی اینکه مخاطب متعلق به خود فرستنده باشد
+    if contact.user_id != user_id:
+        await message.answer("❌ شما فقط می‌توانید شماره موبایل خودتان را ارسال کنید.")
         return
 
-    if not await require_access(message):
+    phone = contact.phone_number
+    # نرمال‌سازی شماره ایران
+    phone = phone.replace(" ", "").replace("-", "")
+    if phone.startswith("0"):
+        phone = "+98" + phone[1:]
+    elif phone.startswith("98") and not phone.startswith("+"):
+        phone = "+" + phone
+    elif not phone.startswith("+"):
+        phone = "+98" + phone
+
+    if not re.fullmatch(r"\+989\d{9}", phone):
+        await message.answer("❌ فرمت شماره معتبر نیست. لطفاً از دکمه اشتراک‌گذاری مخاطب استفاده کنید.")
         return
 
-    target = message.text.strip()
-
-    if not (
-        re.fullmatch(r"@[A-Za-z0-9_]{5,32}", target)
-        or re.fullmatch(r"\d{5,20}", target)
-    ):
-        await message.answer("آیدی گیرنده معتبر نیست.")
+    # بررسی اینکه شماره قبلاً توسط کاربر دیگری ثبت نشده باشد
+    existing = await db.get_user_by_phone(phone)
+    if existing and existing["user_id"] != user_id:
+        await message.answer("❌ این شماره قبلاً توسط حساب دیگری ثبت شده است.")
         return
 
-    code = waiting[user_id]
-    name, price = GIFTS[code]
+    data = await state.get_data()
+    referrer_id = data.get("referrer_id")
 
-    async with db.acquire() as c:
-        async with c.transaction():
-            user = await c.fetchrow(
-                "SELECT credits FROM users WHERE user_id=$1 FOR UPDATE",
-                user_id
-            )
-
-            if not user or user["credits"] < price:
-                enough = False
-                order_id = None
-            else:
-                enough = True
-
-                await c.execute(
-                    "UPDATE users SET credits=credits-$1 WHERE user_id=$2",
-                    price, user_id
-                )
-
-                order_id = await c.fetchval("""
-                INSERT INTO orders(user_id,gift_name,price,recipient)
-                VALUES($1,$2,$3,$4)
-                RETURNING id
-                """, user_id, name, price, target)
-
-    waiting.pop(user_id, None)
-
-    if not enough:
-        await message.answer("❌ اعتبار کافی نداری.")
-        return
-
-    await message.answer(
-        f"✅ سفارش شماره {order_id} ثبت شد."
+    await db.upsert_user(
+        user_id=user_id,
+        username=message.from_user.username,
+        full_name=message.from_user.full_name,
+        phone=phone,
+        referrer_id=referrer_id,
     )
 
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[[
-            InlineKeyboardButton(
-                text="✅ تأیید",
-                callback_data=f"approve:{order_id}"
-            ),
-            InlineKeyboardButton(
-                text="❌ رد",
-                callback_data=f"reject:{order_id}"
-            )
-        ]]
-    )
-
-    try:
-        await bot.send_message(
-            OWNER_ID,
-            f"سفارش جدید\n"
-            f"شماره: {order_id}\n"
-            f"کاربر: {user_id}\n"
-            f"گیرنده: {target}\n"
-            f"گیفت: {name}\n"
-            f"قیمت: {price}",
-            reply_markup=keyboard
+    # بررسی عضویت
+    missing = await check_membership(bot, user_id)
+    if missing:
+        await message.answer(
+            f"✅ شماره تأیید شد.\n\nبرای ادامه، در کانال‌های زیر عضو شوید:",
+            reply_markup=channels_keyboard(),
         )
-    except Exception:
-        logging.exception("Owner notification failed")
+    else:
+        # عضویت کامل، تلاش برای پاداش دعوت
+        await db.try_reward_referrer(user_id)
+        await message.answer("✅ ثبت‌نام کامل شد. به منوی اصلی خوش آمدید.", reply_markup=main_menu_keyboard())
+    await state.clear()
 
-
-@dp.callback_query(F.data.startswith("approve:"))
-async def approve(callback: CallbackQuery):
-    if callback.from_user.id != OWNER_ID:
-        await callback.answer("دسترسی غیرمجاز", show_alert=True)
+@router.callback_query(F.data == "check_membership")
+async def cb_check_membership(call: CallbackQuery, bot: Bot):
+    missing = await check_membership(bot, call.from_user.id)
+    if missing:
+        await call.answer("هنوز در همه کانال‌ها عضو نشده‌اید.", show_alert=True)
         return
 
-    order_id = int(callback.data.split(":")[1])
+    # عضو کامل شده، تلاش برای پاداش دعوت
+    await db.try_reward_referrer(call.from_user.id)
+    await call.message.delete()
+    await call.message.answer("✅ عضویت تأیید شد. به منوی اصلی خوش آمدید.", reply_markup=main_menu_keyboard())
+    await call.answer()
 
-    async with db.acquire() as c:
-        result = await c.execute("""
-        UPDATE orders SET status='approved'
-        WHERE id=$1 AND status='pending'
-        """, order_id)
-
-        order = await c.fetchrow(
-            "SELECT * FROM orders WHERE id=$1", order_id
-        )
-
-    if result == "UPDATE 0":
-        await callback.answer("سفارش قبلاً بررسی شده.")
+@router.message(F.text == "🔗 لینک دعوت")
+async def show_invite_link(message: Message, bot: Bot):
+    user_id = message.from_user.id
+    user = await db.get_user(user_id)
+    if not user:
+        await message.answer("لطفاً ابتدا /start را ارسال کنید.")
         return
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[[
-            InlineKeyboardButton(
-                text="📦 ثبت انجام سفارش",
-                callback_data=f"complete:{order_id}"
-            )
-        ]]
-    )
-
-    await callback.message.edit_reply_markup(reply_markup=keyboard)
-
-    await bot.send_message(
-        order["user_id"],
-        f"✅ سفارش {order_id} تأیید شد."
-    )
-
-    await callback.answer("تأیید شد.")
-
-
-@dp.callback_query(F.data.startswith("reject:"))
-async def reject(callback: CallbackQuery):
-    if callback.from_user.id != OWNER_ID:
-        await callback.answer("دسترسی غیرمجاز", show_alert=True)
-        return
-
-    order_id = int(callback.data.split(":")[1])
-
-    async with db.acquire() as c:
-        async with c.transaction():
-            order = await c.fetchrow(
-                "SELECT * FROM orders WHERE id=$1 FOR UPDATE",
-                order_id
-            )
-
-            if not order or order["status"] != "pending":
-                await callback.answer("قبلاً بررسی شده.")
-                return
-
-            await c.execute(
-                "UPDATE orders SET status='rejected' WHERE id=$1",
-                order_id
-            )
-
-            await c.execute(
-                "UPDATE users SET credits=credits+$1 WHERE user_id=$2",
-                order["price"], order["user_id"]
-            )
-
-    await callback.message.edit_text(
-        callback.message.text + "\n\n❌ رد شد؛ اعتبار برگشت خورد."
-    )
-
-    await bot.send_message(
-        order["user_id"],
-        f"❌ سفارش {order_id} رد شد و اعتبار برگشت خورد."
-    )
-
-    await callback.answer("رد شد.")
-
-
-@dp.callback_query(F.data.startswith("complete:"))
-async def complete(callback: CallbackQuery):
-    if callback.from_user.id != OWNER_ID:
-        await callback.answer("دسترسی غیرمجاز", show_alert=True)
-        return
-
-    order_id = int(callback.data.split(":")[1])
-
-    async with db.acquire() as c:
-        async with c.transaction():
-            order = await c.fetchrow(
-                "SELECT * FROM orders WHERE id=$1 FOR UPDATE",
-                order_id
-            )
-
-            if not order or order["status"] != "approved":
-                await callback.answer("سفارش قابل تکمیل نیست.")
-                return
-
-            await c.execute("""
-            UPDATE orders
-            SET status='completed'
-            WHERE id=$1
-            """, order_id)
-
-    try:
-        await bot.send_message(
-            "@BET_1XZX",
-            f"🎉 سفارش انجام شد\n"
-            f"شماره: {order_id}\n"
-            f"گیفت: {order['gift_name']}\n"
-            f"گیرنده: {order['recipient']}\n"
-            f"وضعیت: انجام شده"
-        )
-    except Exception:
-        logging.exception("Order channel publication failed")
-        await callback.answer(
-            "ارسال به کانال ناموفق بود. دسترسی ربات را بررسی کن.",
-            show_alert=True
-        )
-        return
-
-    await callback.message.edit_text(
-        callback.message.text + "\n\n🎉 سفارش انجام شد."
-    )
-
-    await bot.send_message(
-        order["user_id"],
-        f"🎉 سفارش {order_id} انجام شد."
-    )
-
-    await callback.answer("سفارش تکمیل شد.")
-
-
-async def main():
-    global bot_username
-
-    await setup_database()
-
-    # حذف webhook قبلی برای فعال شدن polling
-    await bot.delete_webhook(drop_pending_updates=True)
 
     me = await bot.get_me()
-    bot_username = me.username
+    link = f"https://t.me/{me.username}?start=ref_{user_id}"
+    await message.answer(
+        f"لینک دعوت اختصاصی شما:\n\n`{link}`\n\n"
+        "با دعوت از دوستان خود، پس از تأیید شماره و عضویت آن‌ها، ۲ اعتبار دریافت می‌کنید.",
+        parse_mode="Markdown",
+    )
 
-    logging.info("BOT STARTED: @%s", bot_username)
+@router.message(F.text == "⭐ موجودی استارز")
+async def show_balance(message: Message):
+    user_id = message.from_user.id
+    balance = await db.get_balance(user_id)
+    txs = await db.get_transactions(user_id)
 
-    await dp.start_polling(bot)
+    text = f"⭐ موجودی فعلی شما: **{balance}** اعتبار\n\n"
+    if txs:
+        text += "📋 تاریخچه تراکنش‌ها:\n"
+        for tx in txs:
+            sign = "+" if tx["amount"] > 0 else ""
+            text += f"• {sign}{tx['amount']} — {tx['description'] or tx['type']}\n"
+    else:
+        text += "هنوز تراکنشی ثبت نشده است."
 
+    await message.answer(text, parse_mode="Markdown")
+
+@router.message(F.text == "🎁 خرید گیفت")
+async def show_gifts(message: Message):
+    await message.answer("یک گیفت انتخاب کنید:", reply_markup=gift_keyboard())
+
+@router.callback_query(F.data.startswith("gift:"))
+async def cb_select_gift(call: CallbackQuery, state: FSMContext):
+    key = call.data.split(":")[1]
+    gift = GIFTS.get(key)
+    if not gift:
+        await call.answer("گیفت نامعتبر", show_alert=True)
+        return
+
+    balance = await db.get_balance(call.from_user.id)
+    if balance < gift["price"]:
+        await call.answer(f"موجودی کافی نیست. موجودی شما: {balance} اعتبار", show_alert=True)
+        return
+
+    await state.update_data(gift_key=key, gift_price=gift["price"], gift_name=gift["name"])
+    await state.set_state(BuyGift.waiting_recipient)
+    await call.message.edit_text(
+        f"شما {gift['name']} را به قیمت {gift['price']} اعتبار انتخاب کردید.\n\n"
+        "لطفاً آیدی عددی یا یوزرنیم گیرنده را ارسال کنید:",
+        reply_markup=back_keyboard(),
+    )
+    await call.answer()
+
+@router.message(BuyGift.waiting_recipient)
+async def receive_recipient(message: Message, state: FSMContext):
+    recipient = message.text.strip()
+    if not recipient:
+        await message.answer("لطفاً یک آیدی معتبر ارسال کنید.")
+        return
+
+    data = await state.get_data()
+    gift_name = data["gift_name"]
+    gift_price = data["gift_price"]
+
+    await state.update_data(recipient=recipient)
+    await state.set_state(BuyGift.confirming)
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ تأیید نهایی خرید", callback_data="confirm_purchase")
+    kb.button(text="🔙 بازگشت", callback_data="main_menu")
+    kb.adjust(1)
+
+    await message.answer(
+        f"📋 پیش‌فاکتور:\n"
+        f"گیفت: {gift_name}\n"
+        f"قیمت: {gift_price} اعتبار\n"
+        f"گیرنده: {recipient}\n\n"
+        f"آیا تأیید می‌کنید؟",
+        reply_markup=kb.as_markup(),
+    )
+
+@router.callback_query(F.data == "confirm_purchase", BuyGift.confirming)
+async def cb_confirm_purchase(call: CallbackQuery, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    gift_key = data["gift_key"]
+    gift_price = data["gift_price"]
+    gift_name = data["gift_name"]
+    recipient = data["recipient"]
+    user_id = call.from_user.id
+
+    order_id = uuid.uuid4().hex[:12].upper()
+    success = await db.create_order(order_id, user_id, gift_key, gift_price, recipient)
+
+    if not success:
+        await call.message.edit_text("❌ موجودی ناکافی است یا خطایی رخ داد. لطفاً دوباره تلاش کنید.")
+        await state.clear()
+        await call.answer()
+        return
+
+    # اطلاع به ادمین
+    user = await db.get_user(user_id)
+    admin_text = (
+        f"🛒 **سفارش جدید**\n\n"
+        f"شناسه: `{order_id}`\n"
+        f"خریدار: {user['full_name']} (`{user_id}`)\n"
+        f"گیرنده: `{recipient}`\n"
+        f"گیفت: {gift_name}\n"
+        f"قیمت: {gift_price}\n"
+        f"تاریخ: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    )
+    try:
+        await bot.send_message(ADMIN_ID, admin_text, parse_mode="Markdown", reply_markup=order_admin_keyboard(order_id))
+    except Exception as e:
+        logger.error(f"ارسال به ادمین ناموفق: {e}")
+
+    await call.message.edit_text(
+        f"✅ سفارش شما ثبت شد.\nشناسه: `{order_id}`\n\nپس از تأیید و انجام، نتیجه اطلاع‌رسانی می‌شود.",
+        parse_mode="Markdown",
+    )
+    await state.clear()
+    await call.answer()
+
+@router.callback_query(F.data.startswith("approve:"))
+async def cb_approve_order(call: CallbackQuery, bot: Bot):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("⛔ شما مجاز به انجام این عملیات نیستید.", show_alert=True)
+        return
+
+    order_id = call.data.split(":")[1]
+    ok = await db.approve_order(order_id)
+    if not ok:
+        await call.answer("سفارش قبلاً پردازش شده یا وجود ندارد.", show_alert=True)
+        return
+
+    order = await db.get_order(order_id)
+    await call.message.edit_text(
+        call.message.text + "\n\n✅ **تأیید شد** — پس از ارسال دستی گیفت، دکمه زیر را بزنید.",
+        parse_mode="Markdown",
+        reply_markup=order_complete_keyboard(order_id),
+    )
+    await call.answer("تأیید شد")
+
+@router.callback_query(F.data.startswith("reject:"))
+async def cb_reject_order(call: CallbackQuery, bot: Bot):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("⛔ شما مجاز به انجام این عملیات نیستید.", show_alert=True)
+        return
+
+    order_id = call.data.split(":")[1]
+    ok = await db.reject_order(order_id)
+    if not ok:
+        await call.answer("سفارش قبلاً پردازش شده یا وجود ندارد.", show_alert=True)
+        return
+
+    order = await db.get_order(order_id)
+    try:
+        await bot.send_message(
+            order["user_id"],
+            f"❌ سفارش `{order_id}` رد شد. {order['gift_price']} اعتبار به موجودی شما بازگشت.",
+            parse_mode="Markdown",
+        )
+    except Exception:
+        pass
+
+    await call.message.edit_text(call.message.text + "\n\n❌ **رد شد** — وجه بازگشت داده شد.", parse_mode="Markdown")
+    await call.answer("رد شد")
+
+@router.callback_query(F.data.startswith("complete:"))
+async def cb_complete_order(call: CallbackQuery, bot: Bot):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("⛔ شما مجاز به انجام این عملیات نیستید.", show_alert=True)
+        return
+
+    order_id = call.data.split(":")[1]
+    ok = await db.mark_order_completed(order_id)
+    if not ok:
+        await call.answer("سفارش تأیید نشده یا قبلاً منتشر شده است.", show_alert=True)
+        return
+
+    order = await db.get_order(order_id)
+    user = await db.get_user(order["user_id"])
+
+    # انتشار در کانال
+    publish_text = (
+        f"✅ **سفارش انجام شد**\n\n"
+        f"شناسه: `{order_id}`\n"
+        f"خریدار: {user['full_name']}\n"
+        f"گیفت: {order['gift_name']}\n"
+        f"گیرنده: `{order['recipient']}`\n"
+        f"تاریخ: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    )
+    try:
+        await bot.send_message(PUBLISH_CHANNEL, publish_text, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"انتشار در کانال ناموفق: {e}")
+
+    try:
+        await bot.send_message(
+            order["user_id"],
+            f"🎉 سفارش `{order_id}` ({order['gift_name']}) انجام و در کانال منتشر شد.",
+            parse_mode="Markdown",
+        )
+    except Exception:
+        pass
+
+    await call.message.edit_text(call.message.text + "\n\n📦 **انجام شد و منتشر شد**", parse_mode="Markdown")
+    await call.answer("ثبت شد")
+
+@router.callback_query(F.data == "main_menu")
+async def cb_main_menu(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.delete()
+    await call.message.answer("منوی اصلی:", reply_markup=main_menu_keyboard())
+    await call.answer()
+
+# ---------- main ----------
+async def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN تنظیم نشده است")
+
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(router)
+
+    # بررسی اتصال
+    me = await bot.get_me()
+    logger.info(f"ربات متصل شد: @{me.username}")
+
+    await db.connect()
+
+    # حذف Webhook باقیمانده
+    await bot.delete_webhook(drop_pending_updates=True)
+
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await db.close()
+        await bot.session.close()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("ربات متوقف شد")
+    except Exception as e:
+        logger.exception(f"خطای مهلک: {e}")
+        sys.exit(1)
