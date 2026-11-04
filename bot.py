@@ -154,7 +154,7 @@ BEGIN
     UPDATE users SET balance = balance + 2 WHERE user_id = v_referrer_id;
     INSERT INTO referrals(referrer_id, referred_id, rewarded)
     VALUES (v_referrer_id, p_referred_id, TRUE)
-    ON CONFLICT DO NOTHING;
+    ON CONFLICT (referred_id) DO NOTHING;
     INSERT INTO transactions(user_id, amount, type, description)
     VALUES (v_referrer_id, 2, 'invite_reward', 'پاداش دعوت کاربر ' || p_referred_id);
     RETURN TRUE;
@@ -194,12 +194,20 @@ class Database:
     async def upsert_user(self, user_id, username, full_name, phone, referrer_id=None):
         async with self.pool.acquire() as conn:
             async with conn.transaction():
-                existing = await conn.fetchrow("SELECT user_id FROM users WHERE user_id = $1", user_id)
+                existing = await conn.fetchrow("SELECT user_id, referrer_id FROM users WHERE user_id = $1", user_id)
                 if existing:
+                    # کاربر از قبل هست: اگه معرف نداشت و الان معرف آورده، ثبتش کن
+                    current_ref = existing["referrer_id"]
+                    final_ref = current_ref if current_ref else (referrer_id if referrer_id != user_id else None)
                     await conn.execute(
-                        "UPDATE users SET username=$1, full_name=$2, phone=$3 WHERE user_id=$4",
-                        username, full_name, phone, user_id,
+                        "UPDATE users SET username=$1, full_name=$2, phone=$3, referrer_id=$4 WHERE user_id=$5",
+                        username, full_name, phone, final_ref, user_id,
                     )
+                    if not current_ref and final_ref:
+                        await conn.execute(
+                            "INSERT INTO referrals(referrer_id, referred_id) VALUES($1,$2) ON CONFLICT (referred_id) DO NOTHING",
+                            final_ref, user_id,
+                        )
                 else:
                     ref = referrer_id if referrer_id != user_id else None
                     await conn.execute(
@@ -209,7 +217,7 @@ class Database:
                     )
                     if ref:
                         await conn.execute(
-                            "INSERT INTO referrals(referrer_id, referred_id) VALUES($1,$2) ON CONFLICT DO NOTHING",
+                            "INSERT INTO referrals(referrer_id, referred_id) VALUES($1,$2) ON CONFLICT (referred_id) DO NOTHING",
                             ref, user_id,
                         )
 
@@ -265,7 +273,6 @@ class Database:
             return val or 0
 
     async def get_transactions(self, user_id: int, limit: int = 20):
-        # جدا کردن این تابع که اگه جدول تراکنش‌ها مشکل داشت، موجودی رو خراب نکنه
         try:
             async with self.pool.acquire() as conn:
                 return await conn.fetch(
@@ -273,8 +280,7 @@ class Database:
                     "WHERE user_id=$1 ORDER BY created_at DESC LIMIT $2",
                     user_id, limit,
                 )
-        except Exception as e:
-            logger.error(f"خطا در خواندن تراکنش‌ها: {e}")
+        except Exception:
             return []
 
 
@@ -362,6 +368,7 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot):
 
     user = await db.get_user(user_id)
     
+    # مرحله ۱: اگر شماره موبایل ندارد، فقط دکمه شماره را نشان بده
     if not user or not user["phone"]:
         await state.update_data(referrer_id=referrer_id)
         await message.answer(
@@ -371,6 +378,21 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot):
         )
         return
 
+    # === مرحله مهم: کاربر شماره داشت (از قبل ثبت‌نام کرده) ===
+    # اگه با لینک رفرال اومده و قبلاً کسی رو معرفی نکرده، ثبتش کن
+    if referrer_id and not user["referrer_id"]:
+        async with db.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET referrer_id=$1 WHERE user_id=$2",
+                referrer_id, user_id
+            )
+            await conn.execute(
+                "INSERT INTO referrals(referrer_id, referred_id) VALUES($1,$2) ON CONFLICT (referred_id) DO NOTHING",
+                referrer_id, user_id,
+            )
+        logger.info(f"معرف {referrer_id} برای کاربر {user_id} ثبت شد")
+
+    # بررسی عضویت
     missing = await check_membership(bot, user_id)
     if missing:
         await message.answer(
@@ -378,6 +400,19 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot):
             reply_markup=channels_keyboard(),
         )
         return
+
+    # اگر عضو بود، پاداش رفرال رو چک کن (اگه کاربر جدید با لینک اومده)
+    rewarded = await db.try_reward_referrer(user_id)
+    if rewarded:
+        ref_id = user["referrer_id"] or referrer_id
+        if ref_id:
+            try:
+                await bot.send_message(
+                    ref_id,
+                    "🎉 یک دوست با لینک دعوت شما وارد شد و پاداش ۲ استارز به حساب شما اضافه شد!"
+                )
+            except Exception as e:
+                logger.error(f"ارسال پیام به معرف ناموفق: {e}")
 
     await message.answer("منوی اصلی:", reply_markup=main_menu_keyboard())
 
@@ -427,16 +462,14 @@ async def handle_contact(message: Message, state: FSMContext, bot: Bot):
         )
     else:
         rewarded = await db.try_reward_referrer(user_id)
-        
-        # ارسال پیام به معرف در صورت موفقیت رفرال
         if rewarded and referrer_id:
             try:
                 await bot.send_message(
                     referrer_id,
-                    f"🎉 یک دوست با لینک شما وارد شد و پاداش ۲ استارز به موجودی شما اضافه شد!"
+                    "🎉 یک دوست با لینک دعوت شما وارد شد و پاداش ۲ استارز به حساب شما اضافه شد!"
                 )
             except Exception as e:
-                logger.error(f"ارسال پیام به معرف ناموفق: {e}")
+                logger.error(f"ارسال پیام رفرال ناموفق: {e}")
 
         await message.answer(
             "✅ شماره شما تأیید شد و در کانال‌ها عضو هستید.\nبه منوی اصلی خوش آمدید:",
@@ -457,13 +490,13 @@ async def cb_check_membership(call: CallbackQuery, bot: Bot):
         return
     
     referrer_id = user["referrer_id"]
-    rewarded = await db.try_reward_referrer(call.from_user.id)
     
+    rewarded = await db.try_reward_referrer(call.from_user.id)
     if rewarded and referrer_id:
         try:
             await bot.send_message(
                 referrer_id,
-                f"🎉 یک دوست با لینک شما وارد شد و پاداش ۲ استارز به موجودی شما اضافه شد!"
+                "🎉 یک دوست با لینک دعوت شما وارد شد و پاداش ۲ استارز به حساب شما اضافه شد!"
             )
         except Exception:
             pass
@@ -513,8 +546,6 @@ async def show_balance(message: Message, state: FSMContext):
     try:
         user_id = message.from_user.id
         balance = await db.get_balance(user_id)
-        
-        # گرفتن تراکنش‌ها با مدیریت خطای داخلی
         txs = await db.get_transactions(user_id)
 
         text = f"⭐ موجودی فعلی شما: **{balance}** استارز\n\n"
