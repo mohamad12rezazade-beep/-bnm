@@ -1,23 +1,25 @@
-import os
-import re
+
 import asyncio
 import logging
-import asyncpg
+import os
+import re
+from contextlib import asynccontextmanager
 
+import asyncpg
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart
 from aiogram.types import (
     Message,
-    KeyboardButton,
+    CallbackQuery,
     ReplyKeyboardMarkup,
+    KeyboardButton,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
-    CallbackQuery,
 )
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from dotenv import load_dotenv
-
-# ---------------- CONFIG ----------------
 
 load_dotenv()
 
@@ -25,69 +27,44 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 OWNER_ID = 8935601841
-ORDER_CHANNEL = "@BET_1XZX"
 
 CHANNELS = [
-    "@BET_1XZX",
-    "@GAP_BAZIN1",
+    ("@BET_1XZX", "https://t.me/BET_1XZX"),
+    ("@GAP_BAZIN1", "https://t.me/GAP_BAZIN1"),
 ]
 
+ORDER_CHANNEL = "@BET_1XZX"
+
 GIFTS = {
-    "🧸 Teddy": 15,
-    "❤️ Heart": 15,
-    "🌹 Flower": 25,
-    "🎁 Gift": 25,
-    "🚀 Rocket": 50,
-    "🎂 Cake": 50,
-    "💎 Diamond": 100,
+    "teddy": ("🧸 خرس", 15),
+    "heart": ("❤️ قلب", 15),
+    "flower": ("🌹 گل", 25),
+    "gift": ("🎁 هدیه", 25),
+    "rocket": ("🚀 موشک", 50),
+    "cake": ("🎂 کیک", 50),
+    "diamond": ("💎 الماس", 100),
 }
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
 
-bot = Bot(token=BOT_TOKEN)
+logger = logging.getLogger(__name__)
+
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+)
+
 dp = Dispatcher()
 
-pool = None
+db_pool = None
+bot_username = None
 
-# نگهداری گیفت انتخاب‌شده تا دریافت آیدی گیرنده
-pending_gifts = {}
+# نگهداری انتخاب موقت هدیه تا دریافت گیرنده
+waiting_for_recipient = {}
 
-
-# ---------------- DATABASE ----------------
-
-async def init_db():
-    global pool
-
-    pool = await asyncpg.create_pool(DATABASE_URL)
-
-    async with pool.acquire() as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id BIGINT PRIMARY KEY,
-                phone TEXT,
-                balance INTEGER NOT NULL DEFAULT 0,
-                referrer BIGINT
-            );
-
-            CREATE TABLE IF NOT EXISTS referrals (
-                invited BIGINT PRIMARY KEY,
-                referrer BIGINT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS orders (
-                id BIGSERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL,
-                gift TEXT NOT NULL,
-                cost INTEGER NOT NULL,
-                recipient TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                created_at TIMESTAMPTZ DEFAULT NOW(),
-                channel_message_id BIGINT
-            );
-        """)
-
-
-# ---------------- KEYBOARDS ----------------
 
 def phone_keyboard():
     return ReplyKeyboardMarkup(
@@ -95,7 +72,7 @@ def phone_keyboard():
             [
                 KeyboardButton(
                     text="📱 تأیید شماره موبایل",
-                    request_contact=True
+                    request_contact=True,
                 )
             ]
         ],
@@ -104,7 +81,7 @@ def phone_keyboard():
     )
 
 
-def main_menu():
+def main_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🔗 لینک دعوت")],
@@ -115,11 +92,8 @@ def main_menu():
     )
 
 
-# ---------------- PHONE VALIDATION ----------------
-
 def normalize_phone(phone):
-    phone = phone.strip()
-    phone = re.sub(r"[\s\-()]", "", phone)
+    phone = re.sub(r"[^\d+]", "", phone or "")
 
     if phone.startswith("0098"):
         phone = "+98" + phone[4:]
@@ -134,180 +108,226 @@ def normalize_phone(phone):
     return None
 
 
-# ---------------- CHANNEL MEMBERSHIP ----------------
+async def init_database():
+    global db_pool
 
-async def check_channels(user_id):
-    for channel in CHANNELS:
+    db_pool = await asyncpg.create_pool(
+        DATABASE_URL,
+        min_size=1,
+        max_size=5,
+        ssl="require",
+    )
+
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                username TEXT,
+                phone TEXT,
+                credits INTEGER NOT NULL DEFAULT 0,
+                referred_by BIGINT,
+                referral_paid BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
+            CREATE TABLE IF NOT EXISTS orders (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                gift_code TEXT NOT NULL,
+                gift_name TEXT NOT NULL,
+                price INTEGER NOT NULL,
+                recipient TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                completed_at TIMESTAMPTZ
+            );
+
+            CREATE INDEX IF NOT EXISTS orders_user_id_idx
+            ON orders(user_id);
+        """)
+
+
+async def save_user(user):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO users (user_id, username)
+            VALUES ($1, $2)
+            ON CONFLICT (user_id)
+            DO UPDATE SET username = EXCLUDED.username
+            """,
+            user.id,
+            user.username,
+        )
+
+
+async def get_user(user_id):
+    async with db_pool.acquire() as conn:
+        return await conn.fetchrow(
+            "SELECT * FROM users WHERE user_id = $1",
+            user_id,
+        )
+
+
+async def is_member(user_id):
+    for channel, _ in CHANNELS:
         try:
-            member = await bot.get_chat_member(
-                chat_id=channel,
-                user_id=user_id,
-            )
+            member = await bot.get_chat_member(channel, user_id)
 
-            if member.status not in ("creator", "administrator", "member"):
+            if member.status in ("left", "kicked"):
                 return False
 
-        except Exception:
-            logging.exception("Channel membership check failed: %s", channel)
+        except (TelegramBadRequest, TelegramForbiddenError):
+            logger.exception("Cannot check membership in %s", channel)
             return False
 
     return True
 
 
-async def show_channel_message(message):
+async def show_join_message(message):
+    buttons = []
+
+    for index, (_, url) in enumerate(CHANNELS, start=1):
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"عضویت در کانال {index}",
+                url=url,
+            )
+        ])
+
+    buttons.append([
+        InlineKeyboardButton(
+            text="✅ بررسی عضویت",
+            callback_data="check_membership",
+        )
+    ])
+
     await message.answer(
-        "برای استفاده از ربات ابتدا عضو هر دو کانال شو:\n\n"
-        "1. https://t.me/BET_1XZX\n"
-        "2. https://t.me/GAP_BAZIN1\n\n"
-        "بعد از عضویت دوباره دستور /start رو بفرست."
+        "برای استفاده از ربات، ابتدا در هر دو کانال زیر عضو شو و بعد روی بررسی عضویت بزن.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
 
 
-# ---------------- REFERRAL ----------------
-
 async def reward_referral(user_id):
-    async with pool.acquire() as db:
-        async with db.transaction():
-
-            user = await db.fetchrow(
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            user = await conn.fetchrow(
                 """
-                SELECT phone, referrer
+                SELECT referred_by, referral_paid
                 FROM users
-                WHERE user_id=$1
+                WHERE user_id = $1
                 FOR UPDATE
                 """,
                 user_id,
             )
 
-            if not user or not user["phone"] or not user["referrer"]:
+            if not user:
                 return
 
-            referrer = user["referrer"]
+            inviter_id = user["referred_by"]
 
-            if referrer == user_id:
+            if not inviter_id or user["referral_paid"]:
                 return
 
-            inserted = await db.fetchval(
+            await conn.execute(
                 """
-                INSERT INTO referrals(invited, referrer)
-                VALUES($1, $2)
-                ON CONFLICT(invited) DO NOTHING
-                RETURNING invited
+                UPDATE users
+                SET credits = credits + 2
+                WHERE user_id = $1
                 """,
-                user_id,
-                referrer,
+                inviter_id,
             )
 
-            if inserted:
-                await db.execute(
-                    """
-                    UPDATE users
-                    SET balance = balance + 2
-                    WHERE user_id=$1
-                    """,
-                    referrer,
-                )
+            await conn.execute(
+                """
+                UPDATE users
+                SET referral_paid = TRUE
+                WHERE user_id = $1
+                """,
+                user_id,
+            )
 
-                try:
-                    await bot.send_message(
-                        referrer,
-                        "🎉 یک دعوت موفق داشتی!\n"
-                        "⭐ ۲ استارز به موجودی تو اضافه شد."
-                    )
-                except Exception:
-                    pass
-
-
-# ---------------- ACCESS CHECK ----------------
-
-async def ensure_access(message):
-    user_id = message.from_user.id
-
-    async with pool.acquire() as db:
-        user = await db.fetchrow(
-            "SELECT phone FROM users WHERE user_id=$1",
-            user_id,
+    try:
+        await bot.send_message(
+            inviter_id,
+            "🎉 دوستت شماره موبایلش رو تأیید کرد و عضو هر دو کانال شد.\n"
+            "⭐ ۲ اعتبار به حسابت اضافه شد.",
         )
+    except Exception:
+        logger.exception("Could not notify inviter")
+
+
+async def check_access(user_id):
+    user = await get_user(user_id)
 
     if not user or not user["phone"]:
-        await message.answer(
-            "برای شروع، شماره موبایلت رو با دکمه زیر تأیید کن.",
-            reply_markup=phone_keyboard(),
-        )
-        return False
+        return "phone"
 
-    if not await check_channels(user_id):
-        await show_channel_message(message)
-        return False
+    if not await is_member(user_id):
+        return "channels"
 
     await reward_referral(user_id)
-    return True
+    return "ok"
 
 
-# ---------------- START ----------------
-
-@dp.message(CommandStart())
-async def start(message: Message):
-    parts = message.text.split()
-    referrer = None
-
-    if len(parts) > 1:
-        try:
-            possible_referrer = int(parts[1])
-
-            if possible_referrer != message.from_user.id:
-                referrer = possible_referrer
-
-        except ValueError:
-            pass
-
-    async with pool.acquire() as db:
-        await db.execute(
-            """
-            INSERT INTO users(user_id, referrer)
-            VALUES($1, $2)
-            ON CONFLICT(user_id) DO NOTHING
-            """,
-            message.from_user.id,
-            referrer,
-        )
-
-        user = await db.fetchrow(
-            "SELECT phone FROM users WHERE user_id=$1",
-            message.from_user.id,
-        )
-
-    if not user["phone"]:
-        await message.answer(
-            "سلام ❤️\n\n"
-            "برای استفاده از ربات، شماره موبایل خودت رو تأیید کن.\n"
-            "روی دکمه زیر بزن:",
-            reply_markup=phone_keyboard(),
-        )
-        return
-
-    if not await check_channels(message.from_user.id):
-        await show_channel_message(message)
-        return
-
-    await reward_referral(message.from_user.id)
-
+async def send_main_menu(message):
     await message.answer(
-        "🎉 خوش اومدی!\nاز منوی زیر استفاده کن.",
-        reply_markup=main_menu(),
+        "سلام! 👋\nبه ربات خرید گیفت خوش اومدی.",
+        reply_markup=main_keyboard(),
     )
 
 
-# ---------------- CONTACT VERIFICATION ----------------
+@dp.message(CommandStart())
+async def start_handler(message: Message):
+    await save_user(message.from_user)
+
+    parts = (message.text or "").split(maxsplit=1)
+
+    if len(parts) == 2 and parts[1].startswith("ref_"):
+        try:
+            inviter_id = int(parts[1][4:])
+
+            if inviter_id != message.from_user.id:
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        """
+                        UPDATE users
+                        SET referred_by = $1
+                        WHERE user_id = $2
+                          AND phone IS NULL
+                          AND referred_by IS NULL
+                        """,
+                        inviter_id,
+                        message.from_user.id,
+                    )
+        except ValueError:
+            pass
+
+    user = await get_user(message.from_user.id)
+
+    if not user or not user["phone"]:
+        await message.answer(
+            "برای شروع، شماره موبایل خودت رو با دکمه زیر تأیید کن.",
+            reply_markup=phone_keyboard(),
+        )
+        return
+
+    access = await check_access(message.from_user.id)
+
+    if access == "channels":
+        await show_join_message(message)
+        return
+
+    await send_main_menu(message)
+
 
 @dp.message(F.contact)
-async def get_contact(message: Message):
-
+async def contact_handler(message: Message):
     contact = message.contact
 
-    if not contact or contact.user_id != message.from_user.id:
+    if contact.user_id != message.from_user.id:
         await message.answer(
-            "❌ لطفاً شماره موبایل خودت رو با دکمه ارسال کن.",
+            "❌ فقط شماره موبایل خودت قابل تأییده.",
             reply_markup=phone_keyboard(),
         )
         return
@@ -316,231 +336,252 @@ async def get_contact(message: Message):
 
     if not phone:
         await message.answer(
-            "❌ فقط شماره موبایل ایران با پیش‌شماره +98 پذیرفته می‌شود.",
+            "❌ شماره معتبر نیست. فقط شماره موبایل ایران با پیش‌شماره +98 پذیرفته می‌شه.",
             reply_markup=phone_keyboard(),
         )
         return
 
-    async with pool.acquire() as db:
-        await db.execute(
+    async with db_pool.acquire() as conn:
+        await conn.execute(
             """
             UPDATE users
-            SET phone=$1
-            WHERE user_id=$2
+            SET phone = $1,
+                username = $2
+            WHERE user_id = $3
             """,
             phone,
+            message.from_user.username,
             message.from_user.id,
         )
 
-    if not await check_channels(message.from_user.id):
-        await message.answer(
-            "✅ شماره موبایل تأیید شد.\n\n"
-            "حالا عضو دو کانال زیر شو و دوباره /start رو بزن:\n\n"
-            "https://t.me/BET_1XZX\n"
-            "https://t.me/GAP_BAZIN1",
-            reply_markup=main_menu(),
-        )
+    if not await is_member(message.from_user.id):
+        await show_join_message(message)
         return
 
     await reward_referral(message.from_user.id)
+    await send_main_menu(message)
 
-    await message.answer(
-        "✅ شماره موبایل با موفقیت تأیید شد!\n"
-        "🎉 خوش اومدی.",
-        reply_markup=main_menu(),
+
+@dp.callback_query(F.data == "check_membership")
+async def membership_callback(callback: CallbackQuery):
+    access = await check_access(callback.from_user.id)
+
+    if access == "phone":
+        await callback.message.answer(
+            "اول شماره موبایلت رو تأیید کن.",
+            reply_markup=phone_keyboard(),
+        )
+        await callback.answer()
+        return
+
+    if access == "channels":
+        await callback.answer(
+            "هنوز عضو هر دو کانال نشدی.",
+            show_alert=True,
+        )
+        return
+
+    await callback.answer("عضویت تأیید شد.")
+
+    await callback.message.answer(
+        "✅ عضویتت تأیید شد.",
+        reply_markup=main_keyboard(),
     )
 
 
-# ---------------- REFERRAL LINK ----------------
+async def require_access(message):
+    access = await check_access(message.from_user.id)
+
+    if access == "phone":
+        await message.answer(
+            "اول شماره موبایلت رو تأیید کن.",
+            reply_markup=phone_keyboard(),
+        )
+        return False
+
+    if access == "channels":
+        await show_join_message(message)
+        return False
+
+    return True
+
 
 @dp.message(F.text == "🔗 لینک دعوت")
-async def referral_link(message: Message):
-
-    if not await ensure_access(message):
+async def referral_handler(message: Message):
+    if not await require_access(message):
         return
 
-    me = await bot.get_me()
-
-    link = f"https://t.me/{me.username}?start={message.from_user.id}"
+    link = f"https://t.me/{bot_username}?start=ref_{message.from_user.id}"
 
     await message.answer(
-        "🔗 لینک دعوت اختصاصی تو:\n\n"
-        f"{link}\n\n"
-        "به ازای هر دعوت موفق، ۲ استارز دریافت می‌کنی."
+        "🔗 لینک اختصاصی دعوت تو:\n"
+        f"<code>{link}</code>\n\n"
+        "با دعوت هر نفر، بعد از تأیید شماره و عضویت در هر دو کانال، "
+        "۲ اعتبار به حسابت اضافه می‌شه."
     )
 
-
-# ---------------- BALANCE ----------------
 
 @dp.message(F.text == "⭐ موجودی استارز")
-async def balance(message: Message):
-
-    if not await ensure_access(message):
+async def balance_handler(message: Message):
+    if not await require_access(message):
         return
 
-    async with pool.acquire() as db:
-        amount = await db.fetchval(
-            "SELECT balance FROM users WHERE user_id=$1",
-            message.from_user.id,
-        )
+    user = await get_user(message.from_user.id)
 
     await message.answer(
-        f"⭐ موجودی استارز شما: {amount} "
+        f"⭐ موجودی اعتبار شما: <b>{user['credits']}</b>"
     )
 
-
-# ---------------- GIFT MENU ----------------
 
 @dp.message(F.text == "🎁 خرید گیفت")
-async def gift_menu(message: Message):
-
-    if not await ensure_access(message):
+async def gifts_handler(message: Message):
+    if not await require_access(message):
         return
 
-    builder = InlineKeyboardBuilder()
+    buttons = []
 
-    for gift, cost in GIFTS.items():
-        builder.button(
-            text=f"{gift} | {cost} ⭐",
-            callback_data=f"gift:{gift}",
-        )
-
-    builder.adjust(2)
+    for code, (name, price) in GIFTS.items():
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"{name} — {price} اعتبار",
+                callback_data=f"gift:{code}",
+            )
+        ])
 
     await message.answer(
-        "🎁 گیفت موردنظرت رو انتخاب کن:",
-        reply_markup=builder.as_markup(),
+        "🎁 گیفت مورد نظرت رو انتخاب کن:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
 
-
-# ---------------- SELECT GIFT ----------------
 
 @dp.callback_query(F.data.startswith("gift:"))
 async def select_gift(callback: CallbackQuery):
+    access = await check_access(callback.from_user.id)
 
-    user_id = callback.from_user.id
-
-    async with pool.acquire() as db:
-        user = await db.fetchrow(
-            "SELECT phone FROM users WHERE user_id=$1",
-            user_id,
-        )
-
-    if not user or not user["phone"]:
+    if access != "ok":
         await callback.answer(
-            "ابتدا شماره موبایلت رو تأیید کن.",
+            "ابتدا شماره و عضویت کانال‌ها رو تأیید کن.",
             show_alert=True,
         )
         return
 
-    if not await check_channels(user_id):
-        await callback.answer(
-            "ابتدا عضو کانال‌های موردنیاز شو.",
-            show_alert=True,
-        )
+    code = callback.data.split(":", 1)[1]
+
+    if code not in GIFTS:
+        await callback.answer("گیفت نامعتبره.", show_alert=True)
         return
 
-    gift = callback.data.split(":", 1)[1]
+    waiting_for_recipient[callback.from_user.id] = code
 
-    if gift not in GIFTS:
-        await callback.answer("گیفت نامعتبر است.", show_alert=True)
-        return
-
-    pending_gifts[user_id] = gift
+    gift_name, price = GIFTS[code]
 
     await callback.message.answer(
-        f"🎁 گیفت انتخابی: {gift}\n\n"
+        f"انتخاب شما: {gift_name}\n"
+        f"قیمت: {price} اعتبار\n\n"
         "حالا آیدی گیرنده رو بفرست.\n"
-        "مثال: @username یا شناسه عددی تلگرام"
+        "مثال: <code>@username</code> یا شناسه عددی تلگرام"
     )
 
     await callback.answer()
 
 
-# ---------------- CREATE ORDER ----------------
+def valid_recipient(value):
+    value = value.strip()
+
+    if re.fullmatch(r"@[A-Za-z0-9_]{5,32}", value):
+        return value
+
+    if re.fullmatch(r"[0-9]{5,20}", value):
+        return value
+
+    return None
+
 
 @dp.message(F.text)
 async def recipient_handler(message: Message):
-
     user_id = message.from_user.id
 
-    if user_id not in pending_gifts:
+    if user_id not in waiting_for_recipient:
         return
 
-    if not await ensure_access(message):
+    if not await require_access(message):
         return
 
-    recipient = message.text.strip()
+    recipient = valid_recipient(message.text)
 
-    if not (
-        re.fullmatch(r"@[A-Za-z0-9_]{5,32}", recipient)
-        or recipient.isdigit()
-    ):
+    if not recipient:
         await message.answer(
-            "❌ آیدی گیرنده معتبر نیست.\n"
-            "مثال: @username یا شناسه عددی تلگرام"
+            "❌ آیدی معتبر نیست.\n"
+            "لطفاً مثل <code>@username</code> یا شناسه عددی بفرست."
         )
         return
 
-    gift = pending_gifts[user_id]
-    cost = GIFTS[gift]
+    code = waiting_for_recipient[user_id]
+    gift_name, price = GIFTS[code]
 
-    try:
-        async with pool.acquire() as db:
-            async with db.transaction():
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            user = await conn.fetchrow(
+                """
+                SELECT credits
+                FROM users
+                WHERE user_id = $1
+                FOR UPDATE
+                """,
+                user_id,
+            )
 
-                balance = await db.fetchval(
-                    """
-                    SELECT balance
-                    FROM users
-                    WHERE user_id=$1
-                    FOR UPDATE
-                    """,
-                    user_id,
-                )
+            if not user or user["credits"] < price:
+                enough = False
+            else:
+                enough = True
 
-                if balance is None or balance < cost:
-                    await message.answer(
-                        "❌ موجودی شما برای این گیفت کافی نیست."
-                    )
-                    return
-
-                await db.execute(
+                await conn.execute(
                     """
                     UPDATE users
-                    SET balance=balance-$1
-                    WHERE user_id=$2
+                    SET credits = credits - $1
+                    WHERE user_id = $2
                     """,
-                    cost,
+                    price,
                     user_id,
                 )
 
-                order_id = await db.fetchval(
+                order_id = await conn.fetchval(
                     """
-                    INSERT INTO orders(
-                        user_id, gift, cost, recipient
-                    )
-                    VALUES($1, $2, $3, $4)
+                    INSERT INTO orders
+                    (user_id, gift_code, gift_name, price, recipient)
+                    VALUES ($1, $2, $3, $4, $5)
                     RETURNING id
                     """,
                     user_id,
-                    gift,
-                    cost,
+                    code,
+                    gift_name,
+                    price,
                     recipient,
                 )
 
-        pending_gifts.pop(user_id, None)
-
-    except Exception:
-        logging.exception("Order creation failed")
-        await message.answer("❌ خطا در ثبت سفارش. دوباره تلاش کن.")
+    if not enough:
+        await message.answer(
+            "❌ اعتبارت کافی نیست. ابتدا از بخش لینک دعوت اعتبار جمع کن."
+        )
+        waiting_for_recipient.pop(user_id, None)
         return
 
-    keyboard = InlineKeyboardMarkup(
+    waiting_for_recipient.pop(user_id, None)
+
+    await message.answer(
+        f"✅ سفارش شماره <b>{order_id}</b> ثبت شد.\n"
+        f"🎁 گیفت: {gift_name}\n"
+        f"👤 گیرنده: <code>{recipient}</code>\n"
+        f"⭐ هزینه: {price} اعتبار\n\n"
+        "سفارش برای بررسی به مدیریت ارسال شد."
+    )
+
+    owner_keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="✅ تأیید انجام سفارش",
+                    text="✅ تأیید سفارش",
                     callback_data=f"approve:{order_id}",
                 ),
                 InlineKeyboardButton(
@@ -551,179 +592,219 @@ async def recipient_handler(message: Message):
         ]
     )
 
-    order_text = (
-        f"🛍 سفارش جدید\n\n"
-        f"🔢 کد سفارش: {order_id}\n"
-        f"🎁 گیفت: {gift}\n"
-        f"⭐ هزینه: {cost}\n"
-        f"👤 گیرنده: {recipient}\n"
-        f"🆔 شناسه خریدار: {user_id}\n\n"
-        f"📌 وضعیت: در انتظار تأیید مالک"
+    try:
+        await bot.send_message(
+            OWNER_ID,
+            f"🛒 <b>سفارش جدید</b>\n\n"
+            f"شماره سفارش: <b>{order_id}</b>\n"
+            f"شناسه خریدار: <code>{user_id}</code>\n"
+            f"نام کاربری خریدار: @{message.from_user.username or 'ندارد'}\n"
+            f"گیفت: {gift_name}\n"
+            f"گیرنده: <code>{recipient}</code>\n"
+            f"هزینه: {price} اعتبار",
+            reply_markup=owner_keyboard,
+        )
+    except Exception:
+        logger.exception("Could not send order to owner")
+
+
+@dp.callback_query(F.data.startswith("approve:"))
+async def approve_order(callback: CallbackQuery):
+    if callback.from_user.id != OWNER_ID:
+        await callback.answer("اجازه دسترسی نداری.", show_alert=True)
+        return
+
+    order_id = int(callback.data.split(":")[1])
+
+    async with db_pool.acquire() as conn:
+        result = await conn.execute(
+            """
+            UPDATE orders
+            SET status = 'approved'
+            WHERE id = $1 AND status = 'pending'
+            """,
+            order_id,
+        )
+
+        order = await conn.fetchrow(
+            "SELECT * FROM orders WHERE id = $1",
+            order_id,
+        )
+
+    if result == "UPDATE 0":
+        await callback.answer("این سفارش قبلاً تعیین تکلیف شده.", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        callback.message.text + "\n\n✅ سفارش تأیید شد.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="📦 ثبت انجام سفارش",
+                        callback_data=f"complete:{order_id}",
+                    )
+                ]
+            ]
+        ),
     )
 
     try:
         await bot.send_message(
-            OWNER_ID,
-            order_text,
-            reply_markup=keyboard,
+            order["user_id"],
+            f"✅ سفارش شماره {order_id} تأیید شد و در حال انجامه.",
         )
     except Exception:
-        logging.exception("Could not notify owner")
+        logger.exception("Could not notify customer")
 
-    await message.answer(
-        f"✅ سفارش شما ثبت شد.\n"
-        f"🔢 کد سفارش: {order_id}\n\n"
-        "بعد از تأیید مالک، سفارش انجام‌شده اعلام می‌شود.",
-        reply_markup=main_menu(),
-    )
+    await callback.answer("سفارش تأیید شد.")
 
 
-# ---------------- OWNER APPROVE / REJECT ----------------
-
-@dp.callback_query(
-    F.data.startswith(("approve:", "reject:"))
-)
-async def order_decision(callback: CallbackQuery):
-
+@dp.callback_query(F.data.startswith("reject:"))
+async def reject_order(callback: CallbackQuery):
     if callback.from_user.id != OWNER_ID:
-        await callback.answer(
-            "⛔ فقط مالک ربات اجازه این کار را دارد.",
-            show_alert=True,
-        )
+        await callback.answer("اجازه دسترسی نداری.", show_alert=True)
         return
 
-    action, order_id_text = callback.data.split(":", 1)
+    order_id = int(callback.data.split(":")[1])
 
-    try:
-        order_id = int(order_id_text)
-    except ValueError:
-        await callback.answer("کد سفارش نامعتبر است.")
-        return
-
-    async with pool.acquire() as db:
-        async with db.transaction():
-
-            order = await db.fetchrow(
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            order = await conn.fetchrow(
                 """
-                SELECT *
-                FROM orders
-                WHERE id=$1
+                SELECT * FROM orders
+                WHERE id = $1
                 FOR UPDATE
                 """,
                 order_id,
             )
 
-            if not order:
-                await callback.answer("سفارش پیدا نشد.")
-                return
-
-            if order["status"] != "pending":
+            if not order or order["status"] != "pending":
                 await callback.answer(
-                    "این سفارش قبلاً تعیین تکلیف شده است.",
+                    "این سفارش قبلاً تعیین تکلیف شده.",
                     show_alert=True,
                 )
                 return
 
-            if action == "approve":
-                status = "approved"
-            else:
-                status = "rejected"
-
-                await db.execute(
-                    """
-                    UPDATE users
-                    SET balance=balance+$1
-                    WHERE user_id=$2
-                    """,
-                    order["cost"],
-                    order["user_id"],
-                )
-
-            await db.execute(
+            await conn.execute(
                 """
                 UPDATE orders
-                SET status=$1
-                WHERE id=$2
+                SET status = 'rejected'
+                WHERE id = $1
                 """,
-                status,
                 order_id,
             )
 
-    if action == "approve":
-
-        result = "✅ وضعیت: انجام شده"
-
-        # پیام سفارش فقط پس از تأیید مالک در کانال منتشر می‌شود.
-        channel_text = (
-            f"🎁 سفارش گیفت انجام شد\n\n"
-            f"🔢 کد سفارش: {order_id}\n"
-            f"🎁 گیفت: {order['gift']}\n"
-            f"👤 گیرنده: {order['recipient']}\n"
-            f"⭐ هزینه: {order['cost']} استارز\n\n"
-            f"✅ وضعیت: انجام شده"
-        )
-
-        try:
-            sent = await bot.send_message(
-                ORDER_CHANNEL,
-                channel_text,
-            )
-
-            async with pool.acquire() as db:
-                await db.execute(
-                    """
-                    UPDATE orders
-                    SET channel_message_id=$1
-                    WHERE id=$2
-                    """,
-                    sent.message_id,
-                    order_id,
-                )
-
-        except Exception:
-            logging.exception("Could not send approved order to channel")
-
-        try:
-            await bot.send_message(
+            await conn.execute(
+                """
+                UPDATE users
+                SET credits = credits + $1
+                WHERE user_id = $2
+                """,
+                order["price"],
                 order["user_id"],
-                f"✅ سفارش شماره {order_id} تأیید شد و انجام شده است."
             )
-        except Exception:
-            pass
-
-    else:
-
-        result = "❌ سفارش رد شد؛ اعتبار به کاربر برگشت داده شد."
-
-        try:
-            await bot.send_message(
-                order["user_id"],
-                f"❌ سفارش شماره {order_id} رد شد.\n"
-                f"⭐ {order['cost']} استارز به موجودی شما برگشت داده شد."
-            )
-        except Exception:
-            pass
 
     await callback.message.edit_text(
-        callback.message.text + "\n\n" + result,
-        reply_markup=None,
+        callback.message.text + "\n\n❌ سفارش رد شد و اعتبار برگشت داده شد."
     )
 
-    await callback.answer("تصمیم ثبت شد.")
+    try:
+        await bot.send_message(
+            order["user_id"],
+            f"❌ سفارش شماره {order_id} رد شد.\n"
+            f"⭐ {order['price']} اعتبار به حسابت برگشت.",
+        )
+    except Exception:
+        logger.exception("Could not notify customer")
+
+    await callback.answer("سفارش رد شد و اعتبار برگشت داده شد.")
 
 
-# ---------------- RUN BOT ----------------
+@dp.callback_query(F.data.startswith("complete:"))
+async def complete_order(callback: CallbackQuery):
+    if callback.from_user.id != OWNER_ID:
+        await callback.answer("اجازه دسترسی نداری.", show_alert=True)
+        return
+
+    order_id = int(callback.data.split(":")[1])
+
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            order = await conn.fetchrow(
+                """
+                SELECT * FROM orders
+                WHERE id = $1
+                FOR UPDATE
+                """,
+                order_id,
+            )
+
+            if not order or order["status"] != "approved":
+                await callback.answer(
+                    "این سفارش قابل تکمیل نیست.",
+                    show_alert=True,
+                )
+                return
+
+            await conn.execute(
+                """
+                UPDATE orders
+                SET status = 'completed',
+                    completed_at = NOW()
+                WHERE id = $1
+                """,
+                order_id,
+            )
+
+    try:
+        await bot.send_message(
+            ORDER_CHANNEL,
+            f"🎉 <b>سفارش انجام شد</b>\n\n"
+            f"شماره سفارش: <b>{order_id}</b>\n"
+            f"🎁 گیفت: {order['gift_name']}\n"
+            f"👤 گیرنده: <code>{order['recipient']}</code>\n"
+            f"📌 وضعیت: <b>انجام شده</b>",
+        )
+    except Exception:
+        logger.exception("Could not publish completed order")
+
+        await callback.answer(
+            "سفارش تکمیل شد، اما ارسال به کانال ناموفق بود. دسترسی ربات به کانال را بررسی کن.",
+            show_alert=True,
+        )
+        return
+
+    await callback.message.edit_text(
+        callback.message.text + "\n\n🎉 سفارش انجام شد و در کانال منتشر شد."
+    )
+
+    try:
+        await bot.send_message(
+            order["user_id"],
+            f"🎉 سفارش شماره {order_id} انجام شد.",
+        )
+    except Exception:
+        logger.exception("Could not notify customer")
+
+    await callback.answer("سفارش تکمیل و در کانال منتشر شد.")
+
 
 async def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("Secret با نام BOT_TOKEN تنظیم نشده است.")
 
-    if not BOT_TOKEN or not DATABASE_URL:
-        raise RuntimeError(
-            "BOT_TOKEN و DATABASE_URL باید در فایل .env تنظیم شوند."
-        )
+    if not DATABASE_URL:
+        raise RuntimeError("Secret با نام DATABASE_URL تنظیم نشده است.")
 
-    await init_db()
+    global bot_username
 
-    logging.info("Bot is running...")
+    await init_database()
+
+    me = await bot.get_me()
+    bot_username = me.username
+
+    logger.info("Bot started: @%s", bot_username)
 
     await dp.start_polling(bot)
 
