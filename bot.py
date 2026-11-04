@@ -400,9 +400,6 @@ async def check_membership(bot: Bot, user_id: int) -> list[str]:
             missing.append(ch["username"])
     return missing
 
-# ==========================================
-# تابع مرکزی پردازش رفرال (تضمینی)
-# ==========================================
 async def process_referral(bot: Bot, user_id: int):
     user = await db.get_user(user_id)
     if not user:
@@ -430,6 +427,133 @@ async def process_referral(bot: Bot, user_id: int):
 
 router = Router()
 
+# ==========================================
+# ادمین: دستور /admin و پنل (اولویت بالا)
+# ==========================================
+@router.message(Command("admin"))
+async def cmd_admin(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await state.clear()
+    await message.answer(
+        "👨‍💻 **پنل مدیریت**\n\nیک گزینه را انتخاب کنید:",
+        reply_markup=admin_panel_keyboard(),
+        parse_mode="Markdown",
+    )
+
+@router.callback_query(F.data == "admin_stats")
+async def cb_admin_stats(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("⛔ دسترسی ندارید", show_alert=True)
+        return
+    stats = await db.get_stats()
+    text = (
+        f"📊 **آمار ربات**\n\n"
+        f"👥 تعداد کاربران: {stats['users']}\n"
+        f"⏳ سفارش‌های در انتظار: {stats['pending']}\n"
+        f"✅ سفارش‌های تکمیل شده: {stats['completed']}\n"
+    )
+    try:
+        await call.message.edit_text(text, parse_mode="Markdown", reply_markup=admin_panel_keyboard())
+    except Exception:
+        await call.message.answer(text, parse_mode="Markdown", reply_markup=admin_panel_keyboard())
+    await call.answer()
+
+@router.callback_query(F.data.in_({"admin_add_balance", "admin_sub_balance"}))
+async def cb_admin_change_balance(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("⛔ دسترسی ندارید", show_alert=True)
+        return
+    op = call.data
+    await state.update_data(admin_op=op)
+    await state.set_state(AdminStates.waiting_user_id)
+    action = "افزایش" if op == "admin_add_balance" else "کاهش"
+    try:
+        await call.message.edit_text(
+            f"✍️ **{action} استارز**\n\nآیدی عددی کاربر مورد نظر را ارسال کنید:",
+            parse_mode="Markdown",
+        )
+    except Exception:
+        await call.message.answer(
+            f"✍️ **{action} استارز**\n\nآیدی عددی کاربر مورد نظر را ارسال کنید:",
+            parse_mode="Markdown",
+        )
+    await call.answer()
+
+@router.message(AdminStates.waiting_user_id)
+async def admin_get_user_id(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        target_id = int(message.text.strip())
+    except (ValueError, TypeError):
+        await message.answer("❌ آیدی نامعتبر است. عدد ارسال کنید.")
+        return
+    target = await db.get_user(target_id)
+    if not target:
+        await message.answer("❌ کاربری با این آیدی یافت نشد.")
+        return
+    await state.update_data(target_id=target_id)
+    await state.set_state(AdminStates.waiting_amount)
+    await message.answer(
+        f"👤 کاربر: {target['full_name'] or '-'}\n"
+        f"💰 موجودی فعلی: {target['balance']} استارز\n\n"
+        f"مقدار استارز را وارد کنید (فقط عدد):",
+    )
+
+@router.message(AdminStates.waiting_amount)
+async def admin_get_amount(message: Message, state: FSMContext, bot: Bot):
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        amount = int(message.text.strip())
+        if amount <= 0:
+            raise ValueError
+    except (ValueError, TypeError):
+        await message.answer("❌ مقدار باید یه عدد مثبت باشه.")
+        return
+    data = await state.get_data()
+    op = data.get("admin_op")
+    target_id = data.get("target_id")
+    if not target_id:
+        await state.clear()
+        await message.answer("خطا: آیدی گم شد. دوباره /admin بزنید.")
+        return
+
+    signed = amount if op == "admin_add_balance" else -amount
+    ok = await db.add_balance(target_id, signed)
+    if not ok:
+        await message.answer("❌ کاربر پیدا نشد یا خطا رخ داد.")
+        await state.clear()
+        return
+
+    new_balance = await db.get_balance(target_id)
+    action = "افزایش" if signed > 0 else "کاهش"
+    await message.answer(
+        f"✅ **{action} انجام شد**\n\n"
+        f"کاربر: `{target_id}`\n"
+        f"مقدار: {signed:+d} استارز\n"
+        f"موجودی جدید: {new_balance} استارز",
+        parse_mode="Markdown",
+        reply_markup=admin_panel_keyboard(),
+    )
+
+    try:
+        await bot.send_message(
+            target_id,
+            f"🎁 موجودی شما تغییر کرد!\n"
+            f"مقدار: {signed:+d} استارز\n"
+            f"موجودی جدید شما: {new_balance} استارز"
+        )
+    except Exception:
+        pass
+
+    await state.clear()
+
+
+# ==========================================
+# استارت و ربات اصلی
+# ==========================================
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext, bot: Bot):
     await state.clear()
@@ -599,124 +723,6 @@ async def show_balance(message: Message, state: FSMContext):
         logger.exception(f"خطا در show_balance: {e}")
         await message.answer("خطا در دریافت موجودی. لطفاً دوباره تلاش کنید.")
 
-# ==========================================
-# پنل ادمین
-# ==========================================
-@router.message(Command("admin"))
-async def cmd_admin(message: Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
-        return  # به غیر ادمین هیچ پاسخی نده
-    await state.clear()
-    await message.answer(
-        "👨‍💻 **پنل مدیریت**\n\nیک گزینه را انتخاب کنید:",
-        reply_markup=admin_panel_keyboard(),
-        parse_mode="Markdown",
-    )
-
-@router.callback_query(F.data == "admin_stats")
-async def cb_admin_stats(call: CallbackQuery):
-    if call.from_user.id != ADMIN_ID:
-        await call.answer("⛔ دسترسی ندارید", show_alert=True)
-        return
-    stats = await db.get_stats()
-    text = (
-        f"📊 **آمار ربات**\n\n"
-        f"👥 تعداد کاربران: {stats['users']}\n"
-        f"⏳ سفارش‌های در انتظار: {stats['pending']}\n"
-        f"✅ سفارش‌های تکمیل شده: {stats['completed']}\n"
-    )
-    await call.message.edit_text(text, parse_mode="Markdown", reply_markup=admin_panel_keyboard())
-    await call.answer()
-
-@router.callback_query(F.data.in_({"admin_add_balance", "admin_sub_balance"}))
-async def cb_admin_change_balance(call: CallbackQuery, state: FSMContext):
-    if call.from_user.id != ADMIN_ID:
-        await call.answer("⛔ دسترسی ندارید", show_alert=True)
-        return
-    op = call.data  # admin_add_balance یا admin_sub_balance
-    await state.update_data(admin_op=op)
-    await state.set_state(AdminStates.waiting_user_id)
-    action = "افزایش" if op == "admin_add_balance" else "کاهش"
-    await call.message.edit_text(
-        f"✍️ **{action} استارز**\n\nآیدی عددی کاربر مورد نظر را ارسال کنید:",
-        parse_mode="Markdown",
-    )
-    await call.answer()
-
-@router.message(AdminStates.waiting_user_id)
-async def admin_get_user_id(message: Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
-        return
-    try:
-        target_id = int(message.text.strip())
-    except ValueError:
-        await message.answer("❌ آیدی نامعتبر است. عدد ارسال کنید.")
-        return
-    target = await db.get_user(target_id)
-    if not target:
-        await message.answer("❌ کاربری با این آیدی یافت نشد.")
-        return
-    await state.update_data(target_id=target_id)
-    await state.set_state(AdminStates.waiting_amount)
-    await message.answer(
-        f"👤 کاربر: {target['full_name'] or '-'}\n"
-        f"💰 موجودی فعلی: {target['balance']} استارز\n\n"
-        f"مقدار استارز را وارد کنید (فقط عدد):",
-    )
-
-@router.message(AdminStates.waiting_amount)
-async def admin_get_amount(message: Message, state: FSMContext, bot: Bot):
-    if message.from_user.id != ADMIN_ID:
-        return
-    try:
-        amount = int(message.text.strip())
-        if amount <= 0:
-            raise ValueError
-    except ValueError:
-        await message.answer("❌ مقدار باید یه عدد مثبت باشه.")
-        return
-    data = await state.get_data()
-    op = data.get("admin_op")
-    target_id = data.get("target_id")
-    if not target_id:
-        await state.clear()
-        await message.answer("خطا: آیدی گم شد. دوباره /admin بزنید.")
-        return
-
-    signed = amount if op == "admin_add_balance" else -amount
-    ok = await db.add_balance(target_id, signed)
-    if not ok:
-        await message.answer("❌ کاربر پیدا نشد یا خطا رخ داد.")
-        await state.clear()
-        return
-
-    new_balance = await db.get_balance(target_id)
-    action = "افزایش" if signed > 0 else "کاهش"
-    await message.answer(
-        f"✅ **{action} انجام شد**\n\n"
-        f"کاربر: `{target_id}`\n"
-        f"مقدار: {signed:+d} استارز\n"
-        f"موجودی جدید: {new_balance} استارز",
-        parse_mode="Markdown",
-        reply_markup=admin_panel_keyboard(),
-    )
-
-    # اطلاع به کاربر
-    try:
-        await bot.send_message(
-            target_id,
-            f"🎁 موجودی شما تغییر کرد!\n"
-            f"مقدار: {signed:+d} استارز\n"
-            f"موجودی جدید شما: {new_balance} استارز"
-        )
-    except Exception:
-        pass
-
-    await state.clear()
-
-# ==========================================
-# خرید گیفت
-# ==========================================
 @router.callback_query(F.data.startswith("gift:"))
 async def cb_select_gift(call: CallbackQuery, state: FSMContext, bot: Bot):
     try:
