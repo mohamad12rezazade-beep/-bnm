@@ -59,62 +59,68 @@ logger = logging.getLogger(__name__)
 
 # ---------- SQL خودکارسازی دیتابیس ----------
 INIT_SQL = """
-CREATE TABLE IF NOT EXISTS users (
-    user_id BIGINT PRIMARY KEY,
-    username TEXT,
-    full_name TEXT,
-    phone TEXT UNIQUE,
-    balance INTEGER NOT NULL DEFAULT 0,
-    referrer_id BIGINT,
-    referrer_rewarded BOOLEAN NOT NULL DEFAULT FALSE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
+-- =============== USERS ===============
+CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS full_name TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS balance INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS referrer_id BIGINT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS referrer_rewarded BOOLEAN NOT NULL DEFAULT FALSE;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS full_name TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 
-CREATE TABLE IF NOT EXISTS orders (
-    order_id TEXT PRIMARY KEY,
-    user_id BIGINT NOT NULL,
-    gift_name TEXT NOT NULL,
-    gift_price INTEGER NOT NULL CHECK (gift_price > 0),
-    recipient TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected','completed')),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    published BOOLEAN NOT NULL DEFAULT FALSE
-);
+DO $$
+BEGIN
+    BEGIN
+        ALTER TABLE users ADD CONSTRAINT users_phone_unique UNIQUE (phone);
+    EXCEPTION WHEN duplicate_table THEN NULL;
+             WHEN duplicate_object THEN NULL;
+    END;
+END $$;
 
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS published BOOLEAN NOT NULL DEFAULT FALSE;
+-- =============== ORDERS ===============
+CREATE TABLE IF NOT EXISTS orders (order_id TEXT PRIMARY KEY);
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS user_id BIGINT;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS gift_name TEXT;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS gift_price INTEGER;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS recipient TEXT;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending';
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS published BOOLEAN NOT NULL DEFAULT FALSE;
 
-CREATE TABLE IF NOT EXISTS referrals (
-    id BIGSERIAL PRIMARY KEY,
-    referrer_id BIGINT NOT NULL,
-    referred_id BIGINT NOT NULL UNIQUE,
-    rewarded BOOLEAN NOT NULL DEFAULT FALSE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
+-- =============== REFERRALS ===============
+CREATE TABLE IF NOT EXISTS referrals (id BIGSERIAL PRIMARY KEY);
+ALTER TABLE referrals ADD COLUMN IF NOT EXISTS referrer_id BIGINT;
+ALTER TABLE referrals ADD COLUMN IF NOT EXISTS referred_id BIGINT;
+ALTER TABLE referrals ADD COLUMN IF NOT EXISTS rewarded BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE referrals ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 
-CREATE TABLE IF NOT EXISTS transactions (
-    id BIGSERIAL PRIMARY KEY,
-    user_id BIGINT NOT NULL,
-    amount INTEGER NOT NULL,
-    type TEXT NOT NULL,
-    description TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
+DO $$
+BEGIN
+    BEGIN
+        ALTER TABLE referrals ADD CONSTRAINT referrals_referred_unique UNIQUE (referred_id);
+    EXCEPTION WHEN duplicate_table THEN NULL;
+             WHEN duplicate_object THEN NULL;
+    END;
+END $$;
 
+-- =============== TRANSACTIONS ===============
+CREATE TABLE IF NOT EXISTS transactions (id BIGSERIAL PRIMARY KEY);
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS user_id BIGINT;
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS amount INTEGER;
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS type TEXT;
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS description TEXT;
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+-- =============== INDEXES ===============
 CREATE INDEX IF NOT EXISTS idx_users_phone ON users(phone);
 CREATE INDEX IF NOT EXISTS idx_users_referrer ON users(referrer_id);
 CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id);
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
 CREATE INDEX IF NOT EXISTS idx_transactions_user ON transactions(user_id);
 
+-- =============== FUNCTIONS ===============
 CREATE OR REPLACE FUNCTION create_order_atomic(
     p_order_id TEXT,
     p_user_id BIGINT,
@@ -180,14 +186,16 @@ class Database:
     async def connect(self):
         if not DATABASE_URL:
             raise RuntimeError("DATABASE_URL تنظیم نشده است")
+        
+        # Supabase نیاز به SSL داره
         self.pool = await asyncpg.create_pool(
-            DATABASE_URL, min_size=1, max_size=5, command_timeout=30
+            DATABASE_URL, min_size=1, max_size=5, command_timeout=60, ssl="require"
         )
         async with self.pool.acquire() as conn:
             await conn.execute("SELECT 1")
-            logger.info("دیتابیس متصل شد، در حال ساخت جدول‌ها...")
+            logger.info("دیتابیس متصل شد، در حال ساخت جدول‌ها و ستون‌ها...")
             await conn.execute(INIT_SQL)
-            logger.info("✅ جدول‌ها و ستون‌ها با موفقیت آماده شدند")
+            logger.info("✅ جدول‌ها، ستون‌ها و توابع با موفقیت آماده شدند")
 
     async def close(self):
         if self.pool:
