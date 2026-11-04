@@ -1,27 +1,48 @@
-
 name: Telegram Gift Bot
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:          # ← دکمه دستی (Run workflow)
+  schedule:
+    - cron: "0 */5 * * *"     # ← هر ۵ ساعت خودکار روشن می‌شه
+  push:
+    branches: [main]          # ← هر بار کد push کردی، خودکار روشن می‌شه
+
+concurrency:
+  group: telegram-gift-bot
+  cancel-in-progress: false
 
 jobs:
-  bot:
+  run-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 290       # کمتر از ۵ ساعت، چون cron هر ۵ ساعت اجرا می‌شه
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
-      - name: Install
-        run: pip install -r requirements.txt
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Check secrets
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          if [ -z "$BOT_TOKEN" ]; then echo "::error::BOT_TOKEN missing"; exit 1; fi
+          if [ -z "$DATABASE_URL" ]; then echo "::error::DATABASE_URL missing"; exit 1; fi
+          echo "Secrets OK"
 
       - name: Run bot
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: python -u bot.py
+          PYTHONUNBUFFERED: "1"
+        run: python bot.py
