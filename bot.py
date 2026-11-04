@@ -10,7 +10,7 @@ import asyncpg
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -196,7 +196,6 @@ class Database:
             async with conn.transaction():
                 existing = await conn.fetchrow("SELECT user_id, referrer_id FROM users WHERE user_id = $1", user_id)
                 if existing:
-                    # کاربر از قبل هست: اگه معرف نداشت و الان معرف آورده، ثبتش کن
                     current_ref = existing["referrer_id"]
                     final_ref = current_ref if current_ref else (referrer_id if referrer_id != user_id else None)
                     await conn.execute(
@@ -225,6 +224,19 @@ class Database:
         async with self.pool.acquire() as conn:
             result = await conn.fetchval("SELECT reward_referrer_atomic($1)", user_id)
             return bool(result)
+
+    async def set_referrer(self, user_id: int, referrer_id: int) -> bool:
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow("SELECT referrer_id FROM users WHERE user_id=$1", user_id)
+                if not row or row["referrer_id"]:
+                    return False
+                await conn.execute("UPDATE users SET referrer_id=$1 WHERE user_id=$2", referrer_id, user_id)
+                await conn.execute(
+                    "INSERT INTO referrals(referrer_id, referred_id) VALUES($1,$2) ON CONFLICT (referred_id) DO NOTHING",
+                    referrer_id, user_id,
+                )
+                return True
 
     async def create_order(self, order_id, user_id, gift_key, price, recipient) -> bool:
         gift_name = GIFTS[gift_key]["name"]
@@ -272,6 +284,32 @@ class Database:
             val = await conn.fetchval("SELECT balance FROM users WHERE user_id=$1", user_id)
             return val or 0
 
+    async def add_balance(self, user_id: int, amount: int) -> bool:
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow("SELECT balance FROM users WHERE user_id=$1 FOR UPDATE", user_id)
+                if not row:
+                    return False
+                new_balance = max(0, (row["balance"] or 0) + amount)
+                await conn.execute("UPDATE users SET balance=$1 WHERE user_id=$2", new_balance, user_id)
+                desc = "افزایش توسط ادمین" if amount > 0 else "کاهش توسط ادمین"
+                await conn.execute(
+                    "INSERT INTO transactions(user_id, amount, type, description) VALUES($1,$2,'admin_adjust',$3)",
+                    user_id, amount, desc,
+                )
+                return True
+
+    async def get_stats(self):
+        async with self.pool.acquire() as conn:
+            users_count = await conn.fetchval("SELECT COUNT(*) FROM users")
+            orders_pending = await conn.fetchval("SELECT COUNT(*) FROM orders WHERE status='pending'")
+            orders_completed = await conn.fetchval("SELECT COUNT(*) FROM orders WHERE status='completed'")
+            return {
+                "users": users_count or 0,
+                "pending": orders_pending or 0,
+                "completed": orders_completed or 0,
+            }
+
     async def get_transactions(self, user_id: int, limit: int = 20):
         try:
             async with self.pool.acquire() as conn:
@@ -289,6 +327,10 @@ db = Database()
 class BuyGift(StatesGroup):
     waiting_recipient = State()
     confirming = State()
+
+class AdminStates(StatesGroup):
+    waiting_user_id = State()
+    waiting_amount = State()
 
 def main_menu_keyboard():
     kb = ReplyKeyboardBuilder()
@@ -337,6 +379,15 @@ def channels_keyboard():
     kb.adjust(1)
     return kb.as_markup()
 
+def admin_panel_keyboard():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="➕ افزایش استارز کاربر", callback_data="admin_add_balance")
+    kb.button(text="➖ کاهش استارز کاربر", callback_data="admin_sub_balance")
+    kb.button(text="📊 آمار ربات", callback_data="admin_stats")
+    kb.button(text="🔙 بستن پنل", callback_data="main_menu")
+    kb.adjust(1)
+    return kb.as_markup()
+
 async def check_membership(bot: Bot, user_id: int) -> list[str]:
     missing = []
     for ch in CHANNELS:
@@ -348,6 +399,34 @@ async def check_membership(bot: Bot, user_id: int) -> list[str]:
             logger.warning(f"بررسی عضویت {ch['username']} ناموفق: {e}")
             missing.append(ch["username"])
     return missing
+
+# ==========================================
+# تابع مرکزی پردازش رفرال (تضمینی)
+# ==========================================
+async def process_referral(bot: Bot, user_id: int):
+    user = await db.get_user(user_id)
+    if not user:
+        return
+    if not user["phone"]:
+        return
+    if not user["referrer_id"]:
+        return
+    if user["referrer_rewarded"]:
+        return
+    missing = await check_membership(bot, user_id)
+    if missing:
+        return
+    rewarded = await db.try_reward_referrer(user_id)
+    if rewarded:
+        try:
+            await bot.send_message(
+                user["referrer_id"],
+                "🎉 یک دوست با لینک دعوت شما وارد شد و پاداش ۲ استارز به حساب شما اضافه شد!"
+            )
+            logger.info(f"✅ پاداش رفرال برای {user['referrer_id']} ثبت شد")
+        except Exception as e:
+            logger.error(f"خطا در ارسال پیام به معرف {user['referrer_id']}: {e}")
+
 
 router = Router()
 
@@ -368,7 +447,6 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot):
 
     user = await db.get_user(user_id)
     
-    # مرحله ۱: اگر شماره موبایل ندارد، فقط دکمه شماره را نشان بده
     if not user or not user["phone"]:
         await state.update_data(referrer_id=referrer_id)
         await message.answer(
@@ -378,21 +456,10 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot):
         )
         return
 
-    # === مرحله مهم: کاربر شماره داشت (از قبل ثبت‌نام کرده) ===
-    # اگه با لینک رفرال اومده و قبلاً کسی رو معرفی نکرده، ثبتش کن
     if referrer_id and not user["referrer_id"]:
-        async with db.pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE users SET referrer_id=$1 WHERE user_id=$2",
-                referrer_id, user_id
-            )
-            await conn.execute(
-                "INSERT INTO referrals(referrer_id, referred_id) VALUES($1,$2) ON CONFLICT (referred_id) DO NOTHING",
-                referrer_id, user_id,
-            )
-        logger.info(f"معرف {referrer_id} برای کاربر {user_id} ثبت شد")
+        await db.set_referrer(user_id, referrer_id)
+        logger.info(f"🔗 معرف {referrer_id} برای کاربر {user_id} ثبت شد")
 
-    # بررسی عضویت
     missing = await check_membership(bot, user_id)
     if missing:
         await message.answer(
@@ -401,19 +468,7 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot):
         )
         return
 
-    # اگر عضو بود، پاداش رفرال رو چک کن (اگه کاربر جدید با لینک اومده)
-    rewarded = await db.try_reward_referrer(user_id)
-    if rewarded:
-        ref_id = user["referrer_id"] or referrer_id
-        if ref_id:
-            try:
-                await bot.send_message(
-                    ref_id,
-                    "🎉 یک دوست با لینک دعوت شما وارد شد و پاداش ۲ استارز به حساب شما اضافه شد!"
-                )
-            except Exception as e:
-                logger.error(f"ارسال پیام به معرف ناموفق: {e}")
-
+    await process_referral(bot, user_id)
     await message.answer("منوی اصلی:", reply_markup=main_menu_keyboard())
 
 @router.message(F.contact)
@@ -461,16 +516,7 @@ async def handle_contact(message: Message, state: FSMContext, bot: Bot):
             reply_markup=channels_keyboard(),
         )
     else:
-        rewarded = await db.try_reward_referrer(user_id)
-        if rewarded and referrer_id:
-            try:
-                await bot.send_message(
-                    referrer_id,
-                    "🎉 یک دوست با لینک دعوت شما وارد شد و پاداش ۲ استارز به حساب شما اضافه شد!"
-                )
-            except Exception as e:
-                logger.error(f"ارسال پیام رفرال ناموفق: {e}")
-
+        await process_referral(bot, user_id)
         await message.answer(
             "✅ شماره شما تأیید شد و در کانال‌ها عضو هستید.\nبه منوی اصلی خوش آمدید:",
             reply_markup=main_menu_keyboard(),
@@ -488,18 +534,8 @@ async def cb_check_membership(call: CallbackQuery, bot: Bot):
     if missing:
         await call.answer("هنوز در همه کانال‌ها عضو نشده‌اید.", show_alert=True)
         return
-    
-    referrer_id = user["referrer_id"]
-    
-    rewarded = await db.try_reward_referrer(call.from_user.id)
-    if rewarded and referrer_id:
-        try:
-            await bot.send_message(
-                referrer_id,
-                "🎉 یک دوست با لینک دعوت شما وارد شد و پاداش ۲ استارز به حساب شما اضافه شد!"
-            )
-        except Exception:
-            pass
+
+    await process_referral(bot, call.from_user.id)
 
     try:
         await call.message.delete()
@@ -563,6 +599,124 @@ async def show_balance(message: Message, state: FSMContext):
         logger.exception(f"خطا در show_balance: {e}")
         await message.answer("خطا در دریافت موجودی. لطفاً دوباره تلاش کنید.")
 
+# ==========================================
+# پنل ادمین
+# ==========================================
+@router.message(Command("admin"))
+async def cmd_admin(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return  # به غیر ادمین هیچ پاسخی نده
+    await state.clear()
+    await message.answer(
+        "👨‍💻 **پنل مدیریت**\n\nیک گزینه را انتخاب کنید:",
+        reply_markup=admin_panel_keyboard(),
+        parse_mode="Markdown",
+    )
+
+@router.callback_query(F.data == "admin_stats")
+async def cb_admin_stats(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("⛔ دسترسی ندارید", show_alert=True)
+        return
+    stats = await db.get_stats()
+    text = (
+        f"📊 **آمار ربات**\n\n"
+        f"👥 تعداد کاربران: {stats['users']}\n"
+        f"⏳ سفارش‌های در انتظار: {stats['pending']}\n"
+        f"✅ سفارش‌های تکمیل شده: {stats['completed']}\n"
+    )
+    await call.message.edit_text(text, parse_mode="Markdown", reply_markup=admin_panel_keyboard())
+    await call.answer()
+
+@router.callback_query(F.data.in_({"admin_add_balance", "admin_sub_balance"}))
+async def cb_admin_change_balance(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("⛔ دسترسی ندارید", show_alert=True)
+        return
+    op = call.data  # admin_add_balance یا admin_sub_balance
+    await state.update_data(admin_op=op)
+    await state.set_state(AdminStates.waiting_user_id)
+    action = "افزایش" if op == "admin_add_balance" else "کاهش"
+    await call.message.edit_text(
+        f"✍️ **{action} استارز**\n\nآیدی عددی کاربر مورد نظر را ارسال کنید:",
+        parse_mode="Markdown",
+    )
+    await call.answer()
+
+@router.message(AdminStates.waiting_user_id)
+async def admin_get_user_id(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        target_id = int(message.text.strip())
+    except ValueError:
+        await message.answer("❌ آیدی نامعتبر است. عدد ارسال کنید.")
+        return
+    target = await db.get_user(target_id)
+    if not target:
+        await message.answer("❌ کاربری با این آیدی یافت نشد.")
+        return
+    await state.update_data(target_id=target_id)
+    await state.set_state(AdminStates.waiting_amount)
+    await message.answer(
+        f"👤 کاربر: {target['full_name'] or '-'}\n"
+        f"💰 موجودی فعلی: {target['balance']} استارز\n\n"
+        f"مقدار استارز را وارد کنید (فقط عدد):",
+    )
+
+@router.message(AdminStates.waiting_amount)
+async def admin_get_amount(message: Message, state: FSMContext, bot: Bot):
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        amount = int(message.text.strip())
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ مقدار باید یه عدد مثبت باشه.")
+        return
+    data = await state.get_data()
+    op = data.get("admin_op")
+    target_id = data.get("target_id")
+    if not target_id:
+        await state.clear()
+        await message.answer("خطا: آیدی گم شد. دوباره /admin بزنید.")
+        return
+
+    signed = amount if op == "admin_add_balance" else -amount
+    ok = await db.add_balance(target_id, signed)
+    if not ok:
+        await message.answer("❌ کاربر پیدا نشد یا خطا رخ داد.")
+        await state.clear()
+        return
+
+    new_balance = await db.get_balance(target_id)
+    action = "افزایش" if signed > 0 else "کاهش"
+    await message.answer(
+        f"✅ **{action} انجام شد**\n\n"
+        f"کاربر: `{target_id}`\n"
+        f"مقدار: {signed:+d} استارز\n"
+        f"موجودی جدید: {new_balance} استارز",
+        parse_mode="Markdown",
+        reply_markup=admin_panel_keyboard(),
+    )
+
+    # اطلاع به کاربر
+    try:
+        await bot.send_message(
+            target_id,
+            f"🎁 موجودی شما تغییر کرد!\n"
+            f"مقدار: {signed:+d} استارز\n"
+            f"موجودی جدید شما: {new_balance} استارز"
+        )
+    except Exception:
+        pass
+
+    await state.clear()
+
+# ==========================================
+# خرید گیفت
+# ==========================================
 @router.callback_query(F.data.startswith("gift:"))
 async def cb_select_gift(call: CallbackQuery, state: FSMContext, bot: Bot):
     try:
